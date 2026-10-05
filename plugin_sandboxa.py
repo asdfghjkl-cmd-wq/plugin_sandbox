@@ -126,7 +126,8 @@ def _mode_writes(mode):
 class Policy:
 
     _FREEZE_KEYS = frozenset(('fs_read','fs_write','net','proc','ask','unsafe',
-                              'unsafe_requested','modules','plugin_dir','warnings'))
+                              'unsafe_requested','modules','modules_requested',
+                              'plugin_dir','warnings'))
 
     def __init__(self,plugin_dir):
         self.plugin_dir = os.path.abspath(plugin_dir)
@@ -138,6 +139,9 @@ class Policy:
         self.unsafe = False
         self.unsafe_requested = False
         self.modules = []
+        # 插件在 plugin.json 里只能"申请"模块:modules_requested 是插件填的,
+        # modules 只有宿主 approve_modules() 之后才会非空
+        self.modules_requested = []
         self.warnings = []
         self._frozen = False
 
@@ -160,6 +164,7 @@ class Policy:
         self.fs_read = tuple(self.fs_read)
         self.fs_write = tuple(self.fs_write)
         self.modules = tuple(self.modules)
+        self.modules_requested = tuple(self.modules_requested)
         self.warnings = list(self.warnings)
         self._frozen = True
 
@@ -176,6 +181,7 @@ class Policy:
         snap.unsafe = bool(self.unsafe)
         snap.unsafe_requested = bool(self.unsafe_requested)
         snap.modules = tuple(self.modules)
+        snap.modules_requested = tuple(self.modules_requested)
         snap.warnings = []
         snap._frozen = True
         return snap
@@ -191,6 +197,9 @@ class Policy:
             out.append('外部进程:允许')
         if self.modules:
             out.append('额外模块:' + ','.join(self.modules))
+        pend = [m for m in self.modules_requested if m not in tuple(self.modules)]
+        if pend:
+            out.append('申请额外模块:' + ','.join(pend) + '(未批准)')
         if self.unsafe_requested:
             out.append('插件要求不受沙盒限制(你没确认,当前仍受限)')
         return ' | '.join(out)
@@ -256,9 +265,12 @@ def parse_policy(raw_sandbox,legacy_privilege,plugin_dir):
         else:
             for item in mods:
                 if isinstance(item,str) and item.strip() and re.fullmatch(r'[A-Za-z_][\w.]*',item):
-                    p.modules.append(item)
+                    # 只进 modules_requested:放行与否要宿主 approve_modules() 明示批准
+                    p.modules_requested.append(item)
                 else:
                     p.warnings.append(f'sandbox.modules 里的 {item!r} 不是合法模块名,已忽略')
+            if p.modules_requested:
+                p.warnings.append('sandbox.modules 只是申请,需要宿主 approve_modules() 明示批准')
 
     legacy = legacy_privilege
     if legacy is not None and not isinstance(legacy,(list,tuple)):
@@ -542,6 +554,7 @@ class SandBox:
         self._module_cache = {}
         self.__sealed = False
         self._code_series = 0
+        self._identity_ok = True
         self._build_namespace()
         _entry(self)
         register_plugin_frames(self)
@@ -550,13 +563,16 @@ class SandBox:
         self._register_own_code()
 
     def _own_sources(self):
+        # 返回 ():插件没有可登记的源码;返回 None:读取/解析失败(身份登记失败)
         try:
             path = os.path.join(self.plugin_dir,'plugin.json')
             with io.open(path,'r',encoding='utf-8') as fp:
                 n = _json.load(fp)
             if not isinstance(n,dict):
-                return ()
+                print(f'[沙盒] 插件 {self.name} 的 plugin.json 不是对象,身份登记失败')
+                return None
             out = []
+            failed = False
             for src_key,file_key in (('init','init_file'),('command','command_file')):
                 src = n.get(src_key,'') or ''
                 src = str(src).replace('from b import *','',1)
@@ -567,22 +583,38 @@ class SandBox:
                                      'r',encoding='utf-8') as fp:
                             src = fp.read().replace('from b import *','',1)
                     except Exception:
-                        print(f'[沙盒] 读取 {fname} 失败(第六批身份登记跳过这一段)')
+                        failed = True
+                        print(f'[沙盒] 读取 {fname} 失败,身份登记失败,该插件不应运行')
+                        continue
                 if src.strip():
                     out.append((src_key,src))
+            if failed:
+                return None
             return tuple(out)
         except Exception:
-            return ()
+            print(f'[沙盒] 插件 {self.name} 的 plugin.json 读取/解析失败,'
+                  f'身份登记失败,该插件不应运行')
+            return None
 
     def _register_own_code(self):
-        for kind,src in self._own_sources():
+        ok = True
+        srcs = self._own_sources()
+        for kind,src in (srcs or ()):
             try:
                 code = compile(src,f'<plugin {self.name} {kind}>','exec')
             except Exception as e:
+                ok = False
                 print(f'[沙盒] 插件 {self.name} 的 {kind} 源码无法编译,'
-                      f'身份登记跳过:{e}')
+                      f'身份登记失败,该插件不应运行:{e}')
                 continue
             self.register_plugin_code(code)
+        if srcs is None:
+            ok = False
+        self._identity_ok = ok
+
+    @property
+    def identity_ok(self):
+        return bool(getattr(self,'_identity_ok',False))
 
     def guarded_names(self):
         return frozenset((
@@ -649,12 +681,7 @@ class SandBox:
                 raise SandboxDenied(
                     f'插件 {self.name} 的 {cap} 操作没有授权'
                     f'(判权入口在封存后被改动过),已拒绝:{target}')
-        _facade_enter()
-        try:
-
-            return func(*args,**kwargs)
-        finally:
-            _facade_exit()
+        return func(*args,**kwargs)
 
     def seal(self):
         self.policy.freeze()
@@ -697,6 +724,26 @@ class SandBox:
         self.policy.unsafe = bool(value)
         self.note('unsafe','*',None,f'unsafe={bool(value)}')
 
+    def approve_modules(self,names,_host_token=None):
+        # host-only:插件在 plugin.json 里写的 modules 只是"申请",只有宿主能放行
+        if _host_token is not _HOST_TOKEN:
+            self.violation('approve_modules','插件试图给自己放行模块',None)
+            raise SandboxDenied(f'插件 {self.name} 不能给自己放行模块(只有宿主能)')
+        if is_plugin_frame_on_stack():
+            self.refuse_plugin_caller('approve_modules')
+        if self.is_sealed():
+            raise SandboxDenied(f'插件 {self.name} 的沙盒已封存,不能再放行模块')
+        cur = list(self.policy.modules)
+        for item in (names or ()):
+            if not isinstance(item,str) or not re.fullmatch(r'[A-Za-z_][\w.]*',item):
+                self.violation('approve_modules',f'{item!r} 不是合法模块名,未放行',None)
+                continue
+            if item not in cur:
+                cur.append(item)
+        self.policy.modules = cur
+        self.note('approve_modules','*',None,f'宿主放行模块:{",".join(cur) or "无"}')
+        return tuple(cur)
+
     def _apply_grant(self,cap,target,persist=False):
         if cap in ('fs:read','fs:write'):
             root = self._grant_root(target)
@@ -720,10 +767,11 @@ class SandBox:
         if not target:
             return None
         target = os.path.abspath(os.fspath(target))
-        if os.path.isdir(target):
-            return target
-        parent = os.path.dirname(target)
-        return parent or target
+        # 只有确定目标是已存在的文件时才收窄到父目录;目录原样;不存在时也原样
+        # (宁可范围窄:上浮到父目录会把授权悄悄放大到整个目录)
+        if os.path.isfile(target):
+            return os.path.dirname(target) or target
+        return target
 
     def set_ask(self,func):
         self._ask = func
@@ -766,12 +814,8 @@ class SandBox:
 
     def violation(self,action,detail,target):
         self.note('violation:'+action,'*',target,detail)
-        _facade_enter()
-        try:
-            logging.warning('插件 %s 触发沙盒拦截:%s(%s)',self.name,detail,target)
-            print(f'[沙盒] 插件 {self.name}:{detail}')
-        finally:
-            _facade_exit()
+        logging.warning('插件 %s 触发沙盒拦截:%s(%s)',self.name,detail,target)
+        print(f'[沙盒] 插件 {self.name}:{detail}')
 
     def can(self,cap,target=None,_entry=_auth_entry,_can=_auth_can,
             _tamper=_auth_tamper):
@@ -867,8 +911,12 @@ class SandBox:
         write = _mode_writes(mode)
         cap = 'fs:write' if write else 'fs:read'
         path,durable = self.check_fs(file,write,f'open({mode!r})')
-        return self._guarded(_builtins.open,path,mode,*args,
-                             _auth=self._auth_pair(True,durable,cap,path),**kwargs)
+        got = self._guarded(_builtins.open,path,mode,*args,
+                            _auth=self._auth_pair(True,durable,cap,path),**kwargs)
+        if write:
+            # 写操作可能新增/删除符号链接或 junction,realpath 结果会变,缓存要失效
+            _norm_cache_clear()
+        return got
 
     def fs_listdir(self,path='.'):
         p,durable = self.check_fs(path,False,'listdir')
@@ -897,16 +945,22 @@ class SandBox:
 
     def fs_write_call(self,func,what,path,*args,**kwargs):
         p,durable = self.check_fs(path,True,what)
-        return self._guarded(func,p,*args,
-                             _auth=self._auth_pair(True,durable,'fs:write',p),**kwargs)
+        got = self._guarded(func,p,*args,
+                            _auth=self._auth_pair(True,durable,'fs:write',p),**kwargs)
+        # 写成功后清 realpath 缓存(新建/删除链接、junction 会让旧结果陈旧)
+        _norm_cache_clear()
+        return got
 
     def fs_rename(self,src,dst,**kwargs):
         src,_ = self.check_fs(src,True,'rename')
         dst,durable = self.check_fs(dst,True,'rename')
         auth = self._auth_pair(True,durable,'fs:write',dst)
         if kwargs.pop('replace',False):
-            return self._guarded(os.replace,src,dst,_auth=auth)
-        return self._guarded(os.rename,src,dst,_auth=auth)
+            got = self._guarded(os.replace,src,dst,_auth=auth)
+        else:
+            got = self._guarded(os.rename,src,dst,_auth=auth)
+        _norm_cache_clear()
+        return got
 
     def fs_probe(self,func,path,*args,**kwargs):
         if not self.can('fs:read',path):
@@ -1371,12 +1425,16 @@ class env_box:
             self.a[env_id] = box.namespace
             if self.__sealed or box.is_sealed():
                 return box
-            merged = _merge_policy(box.policy,policy,box.name,name)
-            if merged is not None:
-                box.policy = merged
-                box._build_namespace()
-                print(f'[沙盒] {name} 与 {box.name} 共用 env_id={env_id},'
-                      f'合并后的策略:{merged.describe()}')
+            old_dir = os.path.normcase(os.path.realpath(box.plugin_dir))
+            new_dir = os.path.normcase(os.path.realpath(plugin_dir))
+            if old_dir != new_dir:
+                # env_id 是宿主手里的唯一身份键:不同插件目录共用一个 env_id
+                # 等于把两个插件塞进同一个沙盒,绝不合并策略,直接拒绝
+                box.violation('create',
+                              f'env_id={env_id!r} 已被插件目录 {old_dir} 占用,'
+                              f'拒绝与 {new_dir} 共用沙盒',env_id)
+                raise SandboxDenied(f'env_id={env_id!r} 已被其它插件目录占用,拒绝共用沙盒')
+            # 同一个插件目录重复创建:返回已有盒子,不合并策略、不扩权
             return box
         box = SandBox(env_id,name,plugin_dir,policy)
         self._boxes[env_id] = box
@@ -1422,19 +1480,6 @@ class env_box:
         if box is None:
             raise SandboxDenied(f'没有 env_id={args[0]!r} 的沙盒')
         return box.grant(*args[1:],_host_token=_HOST_TOKEN)
-
-def _merge_policy(old,new,old_name,new_name):
-    if old.unsafe or new.unsafe:
-        return None if old.unsafe else new
-    merged = Policy(old.plugin_dir)
-    merged.fs_read = list(dict.fromkeys(list(old.fs_read) + list(new.fs_read)))
-    merged.fs_write = list(dict.fromkeys(list(old.fs_write) + list(new.fs_write)))
-    merged.net = old.net or new.net
-    merged.proc = old.proc or new.proc
-    merged.ask = old.ask or new.ask
-    merged.modules = list(dict.fromkeys(list(old.modules) + list(new.modules)))
-    merged.warnings = [f'与 {old_name} / {new_name} 共用 env_id,策略已合并']
-    return merged
 
 def _facade_leak(obj,label,name):
     sb = object.__getattribute__(obj,'_d')[0]
@@ -1748,7 +1793,7 @@ class _CodeLedger:
             box.violation(
                 'fake_frame',
                 f'有代码把 co_filename 写成了插件帧名({label}),但它的 code 对象'
-                f'不是宿主编译插件时的那一份;判定按宿主处理(只记一次)',
+                f'不是宿主编译插件时的那一份;按它自称的插件判权(fail-closed)(只记一次)',
                 label)
         except Exception:
             pass
@@ -1839,12 +1884,6 @@ def mark_callback_owner(box,func):
                     _pending_owner.pop(old,None)
     return ok
 
-def _facade_enter():
-    _FRAME_LOCAL.depth = getattr(_FRAME_LOCAL,'depth',0) + 1
-
-def _facade_exit():
-    _FRAME_LOCAL.depth = max(getattr(_FRAME_LOCAL,'depth',1) - 1,0)
-
 def _always_readable(path):
     for root in _ALWAYS_READABLE:
         if under(root,path):
@@ -1865,11 +1904,11 @@ def _box_for_frame(filename,code=None):
     for tag,ours in _FRAME_TAGS.items():
         if filename.startswith(tag):
             _note_fake_frame(ours,filename)
-            return None
+            return ours
     for root,ours in _FRAME_DIRS:
         if root and under(root,filename):
             _note_fake_frame(ours,filename)
-            return None
+            return ours
     return None
 
 def _note_fake_frame(box,filename):
@@ -1992,11 +2031,11 @@ def install_audit_hook():
         for tag,ours in _tags.items():
             if filename.startswith(tag):
                 _led.note_fake_frame(ours,filename)
-                return None
+                return ours
         for root,ours in _dirs:
             if root and _under_fn(root,filename):
                 _led.note_fake_frame(ours,filename)
-                return None
+                return ours
         return None
 
     def _hook_box_on_stack():
@@ -2071,7 +2110,6 @@ def install_audit_hook():
                 return
         if _hook_in_facade_frame():
             return
-        _facade_enter()
         try:
             if _registrar.tampered(len(_tags)):
                 restored = _registrar.rebuild(_tags,_dirs,_norm_fn)
@@ -2114,8 +2152,6 @@ def install_audit_hook():
             if not getattr(_depth,'warned',False):
                 _depth.warned = True
                 logging.exception('沙盒审计钩子内部出错,该事件放行')
-        finally:
-            _facade_exit()
 
     globals()['_AUDIT_HOOK'] = _hook
     sys.addaudithook(_hook)
