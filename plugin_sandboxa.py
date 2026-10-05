@@ -116,9 +116,14 @@ def under(root, path):
         return False
     if r == p:
         return True
-    if not r.endswith(os.sep):
-        r += os.sep
-    return p.startswith(r)
+    # S2:原来用 p.startswith(r + os.sep) 判包含。前缀比较在"根退化成卷根"
+    # 时会被放大(C: + sep -> C:\ 会匹配整个 C 盘),也和 b.py 的 _is_within
+    # 口径不一致(那边专门用 commonpath 并写了理由)。这里对齐成 commonpath:
+    # 不同盘符/UNC 共享会抛 ValueError,那一定不是"之内"。
+    try:
+        return os.path.commonpath([r,p]) == r
+    except (ValueError,OSError,TypeError):
+        return False
 
 def _mode_writes(mode):
     return any(c in mode for c in ('w','a','x','+'))
@@ -383,13 +388,38 @@ class SandboxView:
 
     def __init__(self,sb):
 
-        self.name = sb.name
-        self.can = sb.can
-        self.describe = sb.policy.describe
-        self.events = sb.audit
+        name = sb.name
+        describe = sb.policy.describe
+        events = sb.audit
+        check = sb.can
+        # S1:这里**不能**留任何指向宿主对象的引用。原来写的是
+        #   self.can = sb.can ; self.describe = sb.policy.describe ...
+        # 绑定方法自带 __self__,插件一行 `__sandbox__.can.__self__` 就拿到了
+        # SandBox 本体(然后 __globals__ 拿到 _HOST_TOKEN/真 os)。
+        # 更隐蔽的一版是把它们存成 _check 这类私有属性 —— 下划线只是命名约定,
+        # 实例上照样 `view._check.__self__` 一步到位。
+        # 所以改成:绑定方法只活在闭包格子里,实例属性一律是不带 __self__ 的
+        # 普通函数。闭包仍能被 __closure__ 取出(同进程不可能根治),但少了
+        # "属性 -> 宿主对象"这条最省事的直连。
+        def _describe():
+            return describe()
+
+        def _events(limit=20):
+            return events(limit)
+
+        def _can(cap,target=None):
+            return check(cap,target)
+
+        self.name = name
+        self.describe = _describe
+        self.events = _events
+        self.can = _can
 
     def __repr__(self):
-        return f'<sandbox {self.name}: {self.describe()}>'
+        try:
+            return f'<sandbox {self.name}: {self.describe()}>'
+        except Exception:
+            return f'<sandbox {self.name}>'
 
 _AUTH = {}
 
@@ -621,6 +651,8 @@ class SandBox:
             'can','violation','note','events',
             '_policy_frozen','_org','_session','policy','_sealed_at',
             'namespace','_norm_dir','plugin_dir','name','env_id',
+            # S3:这三个是宿主的回调入口,封存后不该再被换(装载期照常设置)
+            '_ask','_persist','_persist_deny',
         ))
 
     def __setattr__(self,name,value):
@@ -745,8 +777,11 @@ class SandBox:
         return tuple(cur)
 
     def _apply_grant(self,cap,target,persist=False):
+        # 用 _grant_scope 而不是 _grant_root:授权往往发生在文件被创建之前,
+        # 那时 isfile 为假,必须把"即将新建的文件"归一成它所在的目录,
+        # 否则会话里存的是文件路径,目录级的 under() 判定永远通不过。
+        root = self._grant_scope(target) if cap in ('fs:read','fs:write') else None
         if cap in ('fs:read','fs:write'):
-            root = self._grant_root(target)
             self._session[cap].add(root)
             if cap == 'fs:write':
                 self._session['fs:read'].add(root)
@@ -755,31 +790,92 @@ class SandBox:
             self._session[cap] = True
         else:
             raise SandboxDenied(f'没有这种能力:{cap!r}')
-        root = self._grant_root(target) if cap in ('fs:read','fs:write') else None
         _auth_apply_grant(self,cap,root)
         if persist and self._persist is not None:
             try:
-                self._persist(self.name,cap,self._grant_root(target) if target else True)
+                self._persist(self.name,cap,root if target else True)
             except Exception:
                 logging.exception('保存插件授权失败')
 
     def _grant_root(self,target):
+        """授权**作用域**的判定基元,契约由 tests/security_check_fixed.py 固定:
+
+        * 不存在的目标 -> 原样返回(不许上浮到父目录,否则"授权一个文件"会变成"授权整盘")
+        * 已存在的目录 -> 原样返回
+        * 已存在的文件 -> 返回所属目录(白名单是目录级的)
+
+        注意它**不**负责"把即将新建的文件归一成目录"。要那个语义请用
+        _grant_scope()。
+        """
         if not target:
             return None
         target = os.path.abspath(os.fspath(target))
-        # 只有确定目标是已存在的文件时才收窄到父目录;目录原样;不存在时也原样
-        # (宁可范围窄:上浮到父目录会把授权悄悄放大到整个目录)
         if os.path.isfile(target):
             return os.path.dirname(target) or target
         return target
 
-    def set_ask(self,func):
+    def _grant_scope(self,target):
+        """把一次授权归一成"实际会被放开的目录"。
+
+        与 _grant_root 的差别只有一处:目标看起来是个**尚不存在的文件**时,
+        它取父目录,而不是把文件路径本身当成授权根。
+
+        为什么必须这样:fs_open 的判权是 under(root, path),粒度是目录。而授权
+        发生在文件**被创建之前** —— 此时 os.path.isfile 为假,走 _grant_root 会把
+        "…\\b.txt" 当作授权根;下一个文件 "…\\c.txt" 自然不在它下面,
+        于是"用户刚点了允许写入、同目录的下一个文件又被拒",can() 也恒为假
+        (tests/test_sandbox_core.py 的 t_fs_ask 实测)。
+        """
+        root = self._grant_root(target)
+        if root is None:
+            return None
+        if not root.endswith(os.sep) and not os.path.isdir(root):
+            return os.path.dirname(root) or root
+        return root
+
+    def set_ask(self,func,_host_token=None,_allow_plugin_caller=False):
+        # S3:与 grant/set_unsafe 同口径。原先这三个 set_* 既没有宿主凭据、
+        # 也不做插件帧检查,而 _ask 又不在 guarded_names() 里 —— 插件拿到 box
+        # 后 `box.set_ask(lambda *a:'always')` 就能让 _ask_user 收到 ASK_ALWAYS,
+        # 再走 _apply_grant 把自己永久授权,等于一条"用我自己的回调批准我自己
+        # 的请求"的提权链。
+        # 这里用「可选凭据 + 帧检查」而不是强制凭据:本仓库里 set_ask 还有
+        # 十余处宿主侧/探针侧调用点,强制会让它们全部 TypeError。
+        if _host_token is not _HOST_TOKEN and not _allow_plugin_caller:
+            try:
+                blocked = bool(is_plugin_frame_on_stack())
+            except Exception:
+                blocked = True
+            if blocked:
+                self.violation('set_ask',
+                               '插件试图替换自己的权限询问回调(等于自我放行)',None)
+                raise SandboxDenied(
+                    f'插件 {self.name} 不能替换权限询问回调(只有宿主能)')
         self._ask = func
 
-    def set_persist(self,func):
+    def set_persist(self,func,_host_token=None,_allow_plugin_caller=False):
+        # 同上:换成别人的持久化回调就能把"总是允许"写进 config.json
+        if _host_token is not _HOST_TOKEN and not _allow_plugin_caller:
+            try:
+                blocked = bool(is_plugin_frame_on_stack())
+            except Exception:
+                blocked = True
+            if blocked:
+                self.violation('set_persist','插件试图替换授权持久化回调',None)
+                raise SandboxDenied(
+                    f'插件 {self.name} 不能替换授权持久化回调(只有宿主能)')
         self._persist = func
 
-    def set_persist_deny(self,func):
+    def set_persist_deny(self,func,_host_token=None,_allow_plugin_caller=False):
+        if _host_token is not _HOST_TOKEN and not _allow_plugin_caller:
+            try:
+                blocked = bool(is_plugin_frame_on_stack())
+            except Exception:
+                blocked = True
+            if blocked:
+                self.violation('set_persist_deny','插件试图替换"不再询问"持久化回调',None)
+                raise SandboxDenied(
+                    f'插件 {self.name} 不能替换"不再询问"持久化回调(只有宿主能)')
         self._persist_deny = func
 
     def remember_denied(self,cap,target,_host_token=None):
@@ -828,7 +924,9 @@ class SandBox:
         if not target:
             return (cap,'')
         if cap in ('fs:read','fs:write'):
-            root = self._grant_root(target) or _norm(target)
+            # 与 _apply_grant 用同一个作用域口径,否则"不再询问"记下的键
+            # 和实际授权出去的目录对不上
+            root = self._grant_scope(target) or _norm(target)
             return (cap,_norm(root) or str(target))
         return (cap,str(target))
 
@@ -1347,7 +1445,14 @@ class SandBox:
         raise SandboxDenied('沙盒里不允许使用 input()')
 
     def _scope(self,globals):
-        g = globals if isinstance(globals,dict) else self.namespace
+        # S6:原来是把 __builtins__ 直接写进调用方传进来的 dict。插件可以把
+        # **别人的**字典当 globals 传进来(捕获到的帧的 f_globals、_AUTH、
+        # _FRAME_TAGS……),于是这个"防御动作"反而改写了宿主的数据结构。
+        # 改成:只认自己的命名空间,别处的 dict 复制一层再注入。
+        if isinstance(globals,dict) and globals is not self.namespace:
+            g = dict(globals)
+        else:
+            g = self.namespace
         g['__builtins__'] = self.restricted_builtins()
         return g
 
@@ -2148,10 +2253,13 @@ def install_audit_hook():
                         f'插件 {box.name} 的 {what} 绕过了沙盒门面,被审计钩子拒绝:{one}')
         except SandboxDenied:
             raise
-        except Exception:
-            if not getattr(_depth,'warned',False):
-                _depth.warned = True
-                logging.exception('沙盒审计钩子内部出错,该事件放行')
+        except Exception as e:
+            # S5:原来是"记一次日志然后放行"(fail-open)。这与整个系统的
+            # fail-closed 取向相反,且 SANDBOX.md 自认"让钩子自己抛异常"
+            # 就是一种绕法。这里改成拒绝这次操作:钩子判不了就不放行。
+            logging.exception('沙盒审计钩子内部出错,已按拒绝处理(不再放行)')
+            raise RuntimeError(
+                f'沙盒审计钩子内部出错,拒绝该次 {event} 操作:{e}') from e
 
     globals()['_AUDIT_HOOK'] = _hook
     sys.addaudithook(_hook)
