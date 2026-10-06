@@ -295,6 +295,60 @@ def parse_policy(raw_sandbox,legacy_privilege,plugin_dir):
 
 _PROXY_DATA = weakref.WeakKeyDictionary()
 
+def _free_method(func,name='open'):
+    """把绑定方法换成"不带 __self__"的普通函数。
+
+    沙盒里的 open 一律走 SandBox.fs_open,但直接把**绑定方法**交出去,插件一行
+    `open.__self__` 就拿到整个 SandBox 对象(随后 object.__setattr__ 改 _ask 就能
+    自我放行)。这里用闭包包一层:调用行为完全不变,但插件没法再顺着 __self__
+    一步拿到宿主对象 —— 这正是 S1 在 SandboxView 上做过的同类处理。
+
+    同进程内省仍能顺着 __closure__ 摸回去,那是 SANDBOX.md 已声明的固有上限;
+    这里堵的是"完全不需要内省"的那条直连。故意不用 functools.wraps:它会挂上
+    __wrapped__ 指回原绑定方法,等于把刚堵掉的门又开一条。
+    name 要显式给:绑定方法的 __name__ 是 'fs_open',直接透传会让插件看到
+    `open.__name__ == 'fs_open'`,与内建语义不符。
+    """
+    def _call(*args, **kwargs):
+        return func(*args, **kwargs)
+    _call.__name__ = name
+    _call.__doc__ = getattr(func, '__doc__', None)
+    return _call
+
+_AUDIT_LOG = {}          # id(box) -> list,模块私有的审计记账
+_NEVER_ASK_LOG = {}      # id(box) -> set,封存时从 box._never_ask 拷一份独立副本
+
+
+def _audit_log(box,_logs=_AUDIT_LOG):
+    """审计记录放在模块私有的表里,不放 box.events。
+
+    box.events 是可变的实例属性,插件拿到 box 后一句 `box.events.clear()` 就能
+    把审计轨迹抹掉(SANDBOX.md 55 行想守住的正是"拦得住也要记下");__setattr__
+    只拦赋值,拦不住容器内容。同进程内省仍能摸到这张表,那属于已声明的固有上限。
+    """
+    log = _logs.get(id(box))
+    if log is None:
+        log = []
+        _logs[id(box)] = log
+    return log
+
+
+def _safe_repr(value):
+    """把任意值变成可打印的字符串,**绝不调用插件对象的 __str__/__repr__**。
+
+    note/violation 的 code 对象在审计钩子的信任名单里(_hook_in_facade_frame 一见
+    栈上有它们就整体放行),所以在它们的动态范围内对插件交来的对象做 str()/
+    f-string 格式化,等于给插件开了一段免检区:它只要在 __str__ 里做 I/O,那次
+    I/O 就不会被判权、也不留 violation。这里只认 str/数字,其余只报类型名。
+    """
+    if value is None or isinstance(value,(str,int,float,bool)):
+        return value
+    try:
+        return '<%s>' % type(value).__name__
+    except Exception:
+        return '<不可打印对象>'
+
+
 def _real_of(obj):
     try:
         return _PROXY_DATA[obj][1]
@@ -331,6 +385,13 @@ class _Proxy:
             sb.violation('module_attr',f'插件不能访问 {label}._d',None)
             raise SandboxDenied(
                 f'插件不能访问 {label}._d(那是门面的内部数据,拿走就等于把真模块交出去)')
+        if name.startswith('__') and name.endswith('__'):
+            # 这段判断原来只写在 __getattr__ 里,而 __getattr__ 仅在
+            # __getattribute__ 抛 AttributeError 之后才被调用 —— __class__/
+            # __init__/__repr__/__dir__/__getattr__ 这些名字都挂在 _Proxy 类型上,
+            # 会被下面那句 object.__getattribute__ 直接命中,那段代码等于从未生效:
+            # `os.__class__.__init__.__globals__` 一路通到本模块的 globals。
+            raise AttributeError(name)
         return object.__getattribute__(self,name)
 
     def __getattr__(self,item):
@@ -434,6 +495,13 @@ def _auth_entry(box,_auth=_AUTH):
         'org':None,
         'session':box._session,
         'tamper_warned':set(),
+        # 宿主的三个回调入口也搬进记账。guarded_names() 只拦 __setattr__,插件能用
+        # object.__setattr__(box,'_ask',…) 或者 box.__dict__['_ask']=… 直接改写
+        # 实例字典绕过去 —— 判权若还读实体属性,就等于把"用我自己的回调批准我
+        # 自己"这条路原样留着。读记账这份,改写实体属性只留一条影子。
+        'ask':getattr(box,'_ask',None),
+        'persist':getattr(box,'_persist',None),
+        'persist_deny':getattr(box,'_persist_deny',None),
     }
     _auth[id(box)] = ent
     return ent
@@ -471,7 +539,10 @@ def _auth_can(ent,cap,target=None,_under=under,_domain=_auth_domain,
     if pol.unsafe:
         return True
     if cap in ('fs:read','fs:write'):
-        if target is None:
+        # 空路径按"没有目标"处理:under(root,'') 在 Windows 上会把空串归一成
+        # 当前工作目录,于是空路径反而落进授权根 —— 与 b.py 的 _is_within
+        # (空 -> False)以及 S2 注释自称的对齐口径正好相反。
+        if not target:
             return False
         roots = _domain(ent,cap)
         return any(_under(r,target) for r in roots)
@@ -498,6 +569,10 @@ def _auth_bind(box,_entry=_auth_entry,_snapshot=_auth_snapshot_sets,_frozen=_aut
     ent = _entry(box)
     ent['policy'] = box.policy
     _snapshot(ent)
+    # "不再询问"在封存时拷一份**独立副本**进记账。box._never_ask 是可变的实例
+    # 属性,__setattr__ 只拦赋值、拦不住 clear():插件清掉它,用户点过的"不再询问"
+    # 就全部失效,同一个越权请求会被重新弹窗,再点一次"允许"就等于被绕过一次。
+    ent['never_ask'] = set(getattr(box,'_never_ask',()) or ())
     box._policy_frozen = _frozen(ent)
     box._org = dict(ent['org'])
     return ent
@@ -518,8 +593,13 @@ def _auth_apply_grant(box,cap,target_root,_entry=_auth_entry,
         return
     if ent['frozen'] is not None:
         _snapshot(ent)
-        box._policy_frozen = _frozen(ent)
-        box._org = dict(ent['org'])
+        # 封存后 guarded_names() 会让普通赋值抛 SandboxDenied(_policy_frozen/_org
+        # 都在那个名单里),但这里是沙盒**内部**在同步影子副本,属于合法更新,必须
+        # 用 object.__setattr__ 绕开自己的护栏。否则用户点"本次运行都允许/总是允许"
+        # 会先改完 ent['session'](判权真正读的那份)再抛异常:授权没生效、note 走不到、
+        # _persist 也走不到("总是允许"永远不落盘),还留下一条假的 tamper 报警。
+        object.__setattr__(box,'_policy_frozen',_frozen(ent))
+        object.__setattr__(box,'_org',dict(ent['org']))
 
 def _auth_tamper(box,_entry=_auth_entry):
     ent = _entry(box)
@@ -689,9 +769,14 @@ class SandBox:
         return f'<plugin {self.name} '
 
     def _guarded(self,func,*args,_auth=None,_entry=_auth_entry,_can=_auth_can,
-                 _tamper=_auth_tamper,_allow_plugin_caller=False,**kwargs):
-        if (_auth is None and not _allow_plugin_caller
-                and _plugin_code_at(1)):
+                 _tamper=_auth_tamper,**kwargs):
+        # 第 8 批把"插件直接调 _guarded()"堵在 _plugin_code_at(1),但当时还留了
+        # 一个 _allow_plugin_caller=True 的豁免开关 —— 它是**方法参数**,插件自己
+        # 传一个关键字参数就能把整道守卫短路:
+        #     box._guarded(fn,_allow_plugin_caller=True)
+        # 全仓库没有任何调用点需要它(宿主侧调用时栈上本来就没有插件帧,走不到
+        # _plugin_code_at(1) 这条分支),所以直接删除,不再给调用方这个权限。
+        if (_auth is None and _plugin_code_at(1)):
             self.violation(
                 'guarded_frame',
                 '插件直接调用了 _guarded():那是审计钩子"门面帧"判据的来源,'
@@ -776,7 +861,7 @@ class SandBox:
         self.note('approve_modules','*',None,f'宿主放行模块:{",".join(cur) or "无"}')
         return tuple(cur)
 
-    def _apply_grant(self,cap,target,persist=False):
+    def _apply_grant(self,cap,target,persist=False,_entry=_auth_entry):
         # 用 _grant_scope 而不是 _grant_root:授权往往发生在文件被创建之前,
         # 那时 isfile 为假,必须把"即将新建的文件"归一成它所在的目录,
         # 否则会话里存的是文件路径,目录级的 under() 判定永远通不过。
@@ -791,9 +876,10 @@ class SandBox:
         else:
             raise SandboxDenied(f'没有这种能力:{cap!r}')
         _auth_apply_grant(self,cap,root)
-        if persist and self._persist is not None:
+        persist_fn = _entry(self).get('persist')
+        if persist and persist_fn is not None:
             try:
-                self._persist(self.name,cap,root if target else True)
+                persist_fn(self.name,cap,root if target else True)
             except Exception:
                 logging.exception('保存插件授权失败')
 
@@ -829,11 +915,20 @@ class SandBox:
         root = self._grant_root(target)
         if root is None:
             return None
-        if not root.endswith(os.sep) and not os.path.isdir(root):
-            return os.path.dirname(root) or root
-        return root
+        if root.endswith(os.sep) or os.path.isdir(root):
+            return root
+        # 剩下的是"看起来像尚不存在的文件"的情形,上浮到父目录。但必须确认父目录
+        # **真实存在**且不是卷根,否则上浮会把一次授权放大成整个盘符:目标是不存在的
+        # 目录 D:\music\newdir 时,dirname 得到 D:\,一次"总是允许"就放开了整个 D 盘;
+        # 再叠上"不再询问"就是永久静音。
+        parent = os.path.dirname(root)
+        if not parent or parent == root:
+            return root
+        if not os.path.isdir(parent) or os.path.dirname(parent) == parent:
+            return root
+        return parent
 
-    def set_ask(self,func,_host_token=None,_allow_plugin_caller=False):
+    def set_ask(self,func,_host_token=None,_entry=_auth_entry):
         # S3:与 grant/set_unsafe 同口径。原先这三个 set_* 既没有宿主凭据、
         # 也不做插件帧检查,而 _ask 又不在 guarded_names() 里 —— 插件拿到 box
         # 后 `box.set_ask(lambda *a:'always')` 就能让 _ask_user 收到 ASK_ALWAYS,
@@ -841,7 +936,7 @@ class SandBox:
         # 的请求"的提权链。
         # 这里用「可选凭据 + 帧检查」而不是强制凭据:本仓库里 set_ask 还有
         # 十余处宿主侧/探针侧调用点,强制会让它们全部 TypeError。
-        if _host_token is not _HOST_TOKEN and not _allow_plugin_caller:
+        if _host_token is not _HOST_TOKEN:
             try:
                 blocked = bool(is_plugin_frame_on_stack())
             except Exception:
@@ -852,10 +947,11 @@ class SandBox:
                 raise SandboxDenied(
                     f'插件 {self.name} 不能替换权限询问回调(只有宿主能)')
         self._ask = func
+        _entry(self)['ask'] = func
 
-    def set_persist(self,func,_host_token=None,_allow_plugin_caller=False):
+    def set_persist(self,func,_host_token=None,_entry=_auth_entry):
         # 同上:换成别人的持久化回调就能把"总是允许"写进 config.json
-        if _host_token is not _HOST_TOKEN and not _allow_plugin_caller:
+        if _host_token is not _HOST_TOKEN:
             try:
                 blocked = bool(is_plugin_frame_on_stack())
             except Exception:
@@ -865,9 +961,10 @@ class SandBox:
                 raise SandboxDenied(
                     f'插件 {self.name} 不能替换授权持久化回调(只有宿主能)')
         self._persist = func
+        _entry(self)['persist'] = func
 
-    def set_persist_deny(self,func,_host_token=None,_allow_plugin_caller=False):
-        if _host_token is not _HOST_TOKEN and not _allow_plugin_caller:
+    def set_persist_deny(self,func,_host_token=None,_entry=_auth_entry):
+        if _host_token is not _HOST_TOKEN:
             try:
                 blocked = bool(is_plugin_frame_on_stack())
             except Exception:
@@ -877,6 +974,7 @@ class SandBox:
                 raise SandboxDenied(
                     f'插件 {self.name} 不能替换"不再询问"持久化回调(只有宿主能)')
         self._persist_deny = func
+        _entry(self)['persist_deny'] = func
 
     def remember_denied(self,cap,target,_host_token=None):
         if _host_token is not _HOST_TOKEN:
@@ -885,7 +983,12 @@ class SandBox:
             raise SandboxDenied(f'插件 {self.name} 不能伪造"不再询问"记录(只有宿主能)')
         if is_plugin_frame_on_stack():
             self.refuse_plugin_caller('remember_denied')
-        self._never_ask.add(self._ask_key(cap,target))
+        key = self._ask_key(cap,target)
+        self._never_ask.add(key)
+        ent = _entry(self)
+        never = ent.get('never_ask')
+        if never is not None:
+            never.add(key)
         self.note('ask_never_restored',cap,target,'按 config.json 恢复"不再询问"')
         return True
 
@@ -898,20 +1001,33 @@ class SandBox:
         return self._facade
 
     def audit(self,limit=20):
-        return list(self.events[-limit:])
+        # 读模块私有的记账那份,不读 self.events:后者是插件能 clear() 的影子。
+        return list(_audit_log(self)[-limit:])
 
     def note(self,action,cap,target,detail=''):
+        # target/detail 一律不交给插件对象的 __str__(见 _safe_repr)。
         rec = {'plugin':self.name,'action':action,'cap':cap,
-               'target':str(target) if target is not None else None,'detail':detail}
-        self.events.append(rec)
-        if len(self.events) > 200:
-            del self.events[:100]
+               'target':_safe_repr(target),'detail':_safe_repr(detail)}
+        log = _audit_log(self)
+        log.append(rec)
+        if len(log) > 200:
+            del log[:100]
+        # 影子副本:保持 box.events 这个老接口仍能读,但清它不影响上面那份。
+        try:
+            self.events.append(rec)
+            if len(self.events) > 200:
+                del self.events[:100]
+        except Exception:
+            pass
         return rec
 
     def violation(self,action,detail,target):
         self.note('violation:'+action,'*',target,detail)
-        logging.warning('插件 %s 触发沙盒拦截:%s(%s)',self.name,detail,target)
-        print(f'[沙盒] 插件 {self.name}:{detail}')
+        # logging 的惰性 %s 和 f-string 都在本方法的动态范围内执行,同样不能碰
+        # 插件对象 —— 先在这里转成安全字符串再传出去。
+        logging.warning('插件 %s 触发沙盒拦截:%s(%s)',self.name,
+                        _safe_repr(detail),_safe_repr(target))
+        print(f'[沙盒] 插件 {self.name}:{_safe_repr(detail)}')
 
     def can(self,cap,target=None,_entry=_auth_entry,_can=_auth_can,
             _tamper=_auth_tamper):
@@ -930,31 +1046,46 @@ class SandBox:
             return (cap,_norm(root) or str(target))
         return (cap,str(target))
 
-    def _ask_user(self,cap,target,detail):
+    def _ask_user(self,cap,target,detail,_entry=_auth_entry):
         pol = self._policy_for_can()
         if pol.unsafe:
             return True
-        if not pol.ask or self._ask is None:
+        # 回调从记账读,不读 self._ask:封存后插件可以用 object.__setattr__ 或
+        # box.__dict__ 改写实例字典(guarded_names 只拦 __setattr__)。
+        ent = _entry(self)
+        ask = ent.get('ask')
+        if not pol.ask or ask is None:
             return False
         if threading.current_thread() is not threading.main_thread():
             self.note('ask_skipped',cap,target,'不在主线程,不能弹窗,直接拒绝')
             return False
         key = self._ask_key(cap,target)
-        if key in self._never_ask:
+        # 读封存时拷下来的独立副本(见 _auth_bind):box._never_ask 是可变的实例
+        # 属性,插件 clear() 一下就能让已静音的申请重新弹窗。
+        never = ent.get('never_ask')
+        if never is None:
+            never = self._never_ask
+        if key in never:
             self.note('ask_muted',cap,target,'你之前选了"不再询问",直接拒绝')
             return False
         try:
-            ans = self._guarded(self._ask,self,cap,target,detail)
+            # target/detail 先转成安全字符串再交给宿主回调:弹窗会在 _guarded 的
+            # 信任帧里对它们做 f-string 格式化,插件交一个自定义对象、在 __str__
+            # 里做 I/O,就能借这次弹窗无判权地跑通。
+            ans = self._guarded(ask,self,cap,
+                                _safe_repr(target),_safe_repr(detail))
         except Exception:
             logging.exception('插件沙盒的授权询问失败,按拒绝处理')
             return False
         if ans == ASK_NEVER:
+            never.add(key)
             self._never_ask.add(key)
             self.note('ask_never',cap,target,'用户点了"不再询问",以后这一类不再弹窗')
-            if self._persist_deny is not None:
+            pden = ent.get('persist_deny')
+            if pden is not None:
                 try:
-                    self._persist_deny(self.name,cap,
-                                       self._grant_root(target) if target else None)
+                    pden(self.name,cap,
+                         self._grant_root(target) if target else None)
                 except Exception:
                     logging.exception('保存"不再询问"失败')
             return False
@@ -978,6 +1109,14 @@ class SandBox:
         if isinstance(path,int):
             self.violation('fd','不支持用文件描述符访问文件',path)
             raise SandboxDenied('沙盒不允许用文件描述符(fd)访问文件')
+        # 判权和"真正拿去打开/列目录"的必须是**同一个字符串**。原来这里把原对象
+        # 交给 _can(内部 os.fspath 一次),又把原对象原样返回给调用方(内部再
+        # fspath 一次) —— 插件只要自定义 __fspath__,就能第一次返回授权路径、
+        # 第二次返回真正想动的路径。这里归一一次,后面一律只用这个结果。
+        try:
+            path = os.fspath(path)
+        except TypeError:
+            pass
         cap = 'fs:write' if write else 'fs:read'
         if _can(_entry(self),cap,path):
             return path,True
@@ -1006,6 +1145,14 @@ class SandBox:
         if isinstance(file,int):
             self.violation('fd','不支持用文件描述符打开文件',file)
             raise SandboxDenied('沙盒不允许用文件描述符(fd)打开文件')
+        # open(..., opener=cb) 会让**插件提供的回调**在 _guarded 的动态执行期内
+        # 运行,而审计钩子的豁免判据是"调用栈上有 _guarded 的 code 对象" —— 整段
+        # 执行都在豁免范围里,于是 cb 能无判权、无审计记录地对任意路径做 I/O
+        # (夹带)。插件没有任何合理理由传自定义 opener,直接拒绝。
+        # opener 是 open() 的第 8 个参数,对应 *args 的第 6 个(索引 5)。
+        if kwargs.get('opener') is not None or len(args) >= 6:
+            self.violation('opener','插件试图用自定义 opener 夹带文件操作',file)
+            raise SandboxDenied('沙盒不允许给 open() 传 opener(它会绕开逐次判权)')
         write = _mode_writes(mode)
         cap = 'fs:write' if write else 'fs:read'
         path,durable = self.check_fs(file,write,f'open({mode!r})')
@@ -1049,6 +1196,36 @@ class SandBox:
         _norm_cache_clear()
         return got
 
+    def refuse_module_call(self,what,detail):
+        """明确禁用某个门面成员:记一条 violation 再拒绝,而不是静默 AttributeError。"""
+        self.violation(what,detail,None)
+        raise SandboxDenied(detail)
+
+    def fs_makedirs(self,path,*args,**kwargs):
+        """makedirs 的判权版:它会为每一级缺失的父目录各发一次 mkdir。
+
+        整段 os.makedirs 跑在 _guarded 的豁免帧里,审计钩子会把期间所有
+        'os.mkdir'/'os.makedirs' 事件当成"门面自己发起的"放行,所以只校验传进来的
+        那个路径 = 顺手放行授权根之外所有缺失父目录的创建。这里先把会被创建出来的
+        每一级都判一次权(没授权时照常给用户弹窗),再交给真实现。
+        """
+        head = os.path.abspath(os.fspath(path))
+        missing = []
+        cur = head
+        while cur and not os.path.isdir(cur):
+            missing.append(cur)
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        for d in missing:
+            self.check_fs(d,True,'makedirs')
+        p,durable = self.check_fs(path,True,'makedirs')
+        got = self._guarded(os.makedirs,p,*args,
+                            _auth=self._auth_pair(True,durable,'fs:write',p),**kwargs)
+        _norm_cache_clear()
+        return got
+
     def fs_rename(self,src,dst,**kwargs):
         src,_ = self.check_fs(src,True,'rename')
         dst,durable = self.check_fs(dst,True,'rename')
@@ -1087,17 +1264,23 @@ class SandBox:
 
     def os_module(self):
         wrap = {
-            'open':self.fs_open,
+            'open':_free_method(self.fs_open),
             'listdir':self.fs_listdir,
             'scandir':self.fs_scandir,
             'stat':self.fs_stat,
             'walk':self.fs_walk,
             'mkdir':lambda p,*a,**k:self.fs_write_call(os.mkdir,'mkdir',p,*a,**k),
-            'makedirs':lambda p,*a,**k:self.fs_write_call(os.makedirs,'makedirs',p,*a,**k),
+            # makedirs 会对"缺失的每一级父目录"各发一次 mkdir,而整段调用跑在
+            # _guarded 的豁免帧里 —— 只校验叶子路径等于放行父目录的创建。
+            'makedirs':self.fs_makedirs,
             'remove':lambda p,*a,**k:self.fs_write_call(os.remove,'remove',p,*a,**k),
             'unlink':lambda p,*a,**k:self.fs_write_call(os.remove,'unlink',p,*a,**k),
             'rmdir':lambda p,*a,**k:self.fs_write_call(os.rmdir,'rmdir',p,*a,**k),
-            'removedirs':lambda p,*a,**k:self.fs_write_call(os.removedirs,'removedirs',p,*a,**k),
+            # removedirs 的语义是"删掉目标后继续删父目录",豁免粒度(整段调用)与
+            # 判权粒度(叶子)错配,会删掉授权根之外的空目录。直接禁用。
+            'removedirs':lambda *a,**k:self.refuse_module_call(
+                'os.removedirs',
+                'os.removedirs 会连带删除授权根之外的父目录,已禁用;请逐级用 os.rmdir'),
             'utime':lambda p,*a,**k:self.fs_write_call(os.utime,'utime',p,*a,**k),
             'rename':self.fs_rename,
             'replace':lambda s,d:self.fs_rename(s,d,replace=True),
@@ -1140,9 +1323,9 @@ class SandBox:
         wrap = {'argv':list(sys.argv)}
         allow = {'version','version_info','platform','maxsize','float_info','int_info',
                  'byteorder','getdefaultencoding','getfilesystemencoding','getrecursionlimit',
-                 'setrecursionlimit','getswitchinterval','stdout','stderr','stdin',
+                 'getswitchinterval','stdout','stderr','stdin',
                  'executable','hexversion','api_version','implementation'}
-        deny = {'modules','path','meta_path','path_hooks','path_importer_cache','exit','_getframe',
+        deny = {'setrecursionlimit','modules','path','meta_path','path_hooks','path_importer_cache','exit','_getframe',
                 'settrace','setprofile','addaudithook','breakpointhook','displayhook',
                 'excepthook','unraisablehook','__interactivehook__','intern','getrefcount',
                 'set_coroutine_origin_tracking_depth','_xoptions','dont_write_bytecode'}
@@ -1152,7 +1335,7 @@ class SandBox:
         allow = {'BytesIO','StringIO','BufferedReader','BufferedWriter','BufferedRWPair',
                  'TextIOWrapper','UnsupportedOperation','SEEK_SET','SEEK_CUR','SEEK_END',
                  'DEFAULT_BUFFER_SIZE','IOBase','BlockingIOError'}
-        return _Proxy(self,io,'io',allow=allow,wrap={'open':self.fs_open})
+        return _Proxy(self,io,'io',allow=allow,wrap={'open':_free_method(self.fs_open)})
 
     def builtins_view(self):
         ns = self.restricted_builtins()
@@ -1175,10 +1358,14 @@ class SandBox:
         wrap = {
             'File':self.guarded_mutagen_file,
             'flac':_Proxy(self,mutagen.flac,'mutagen.flac',
-                          wrap={'FLAC':self.guarded_mutagen_file}),
+                          wrap={'FLAC':lambda *a,**k:self._guarded_mutagen(mutagen.flac.FLAC,*a,**k)}),
             'id3':_Proxy(self,mutagen.id3,'mutagen.id3',
-                         wrap={'ID3':self.guarded_mutagen_file}),
+                         wrap={'ID3':lambda *a,**k:self._guarded_mutagen(mutagen.id3.ID3,*a,**k)}),
         }
+        # 仍然存在的口子(未修,记在案):mutagen 的其它子包(mp3/mp4/easyid3/
+        # oggvorbis…)里同样有"会打开文件"的类,它们既不在这张 wrap 表里、也不在
+        # 任何 allow 白名单里,被 _Proxy 当成普通子模块原样交出去 —— 那些构造
+        # 不会走 check_fs(收不到弹窗),只能靠审计钩子事后硬拒。
         return _Proxy(self,mutagen,'mutagen',wrap=wrap)
 
     def guarded_image_open(self,fp,*args,**kwargs):
@@ -1189,11 +1376,21 @@ class SandBox:
         return self._guarded(_PILImage.open,fp,*args,_auth=auth,**kwargs)
 
     def guarded_mutagen_file(self,filething,*args,**kwargs):
+        return self._guarded_mutagen(mutagen.File,filething,*args,**kwargs)
+
+    def _guarded_mutagen(self,real_fn,filething,*args,**kwargs):
+        """按"真构造函数 + 目标路径"判权(照 guarded_image_open 的写法)。
+
+        原来 id3.ID3 / flac.FLAC 也被 wrap 到 guarded_mutagen_file,而后者固定调
+        mutagen.File —— 门面名字承诺的是 ID3 标签对象/FLAC 对象,返回的却是"按
+        内容猜出来"的 FileType(格式不符时是 None),ID3(path,v2_version=4) 这类
+        构造参数还会直接 TypeError。
+        """
         auth = None
         if isinstance(filething,(str,bytes,os.PathLike)):
             filething,durable = self.check_fs(filething,False,'读取音频标签')
             auth = self._auth_pair(True,durable,'fs:read',filething)
-        return self._guarded(mutagen.File,filething,*args,_auth=auth,**kwargs)
+        return self._guarded(real_fn,filething,*args,_auth=auth,**kwargs)
 
     def socket_module(self):
         allow = {'AF_INET','AF_INET6','AF_UNIX','SOCK_STREAM','SOCK_DGRAM','SOL_SOCKET',
@@ -1391,6 +1588,12 @@ class SandBox:
         try:
             with self._guarded(_builtins.open,target,'r',encoding='utf-8') as fp:
                 code = compile(fp.read(),target,'exec')
+            # 插件本地模块的 code 也要登记进 code 账本:否则它在栈上是一棵"不
+            # 认识的 code",_guarded 的直接调用者判据(_plugin_code_at(1))会把
+            # "从本地模块里调 box._guarded()"当成宿主调用而放行(第 8 批逃逸的
+            # 本地模块路径)。顺手也消掉 _box_for_frame 那条基于文件名的兜底
+            # 认帧 —— 它会额外留一条假的 violation:fake_frame。
+            register_plugin_code(self,code)
             exec(code,mod.__dict__)
         except Exception:
             del self._local_modules[name]
@@ -1429,7 +1632,7 @@ class SandBox:
             v = getattr(_builtins,k,None)
             if v is not None:
                 b[k] = v
-        b['open'] = self.fs_open
+        b['open'] = _free_method(self.fs_open)
         b['__import__'] = self.import_module
         b['eval'] = self.sandbox_eval
         b['exec'] = self.sandbox_exec
@@ -1460,11 +1663,22 @@ class SandBox:
         g = self._scope(globals)
         if type(source) is type((lambda: 0).__code__):
             register_plugin_code(self,source)
+        else:
+            # 同 sandbox_exec:字符串源码自己编译并登记,否则它的帧在 _guarded
+            # 的直接调用者判据里认不出来。
+            source = compile(source,f'<plugin {self.name} eval>','eval')
+            register_plugin_code(self,source)
         return _builtins.eval(source,g,g if locals is None else locals)
 
     def sandbox_exec(self,source,globals=None,locals=None):
         g = self._scope(globals)
         if type(source) is type((lambda: 0).__code__):
+            register_plugin_code(self,source)
+        else:
+            # 字符串源码原来交给 exec 内部编译,那棵 code 树不在账本里,于是
+            # exec("box._guarded(...)") 的帧被判成"不是插件"而放行。这里自己
+            # 编译并登记,让判据继续按 code 对象身份工作(第 8 批逃逸的 exec 路径)。
+            source = compile(source,f'<plugin {self.name} exec>','exec')
             register_plugin_code(self,source)
         return _builtins.exec(source,g,g if locals is None else locals)
 
@@ -1488,7 +1702,7 @@ class SandBox:
         ns['__builtins__'] = self.restricted_builtins()
         ns['__sandbox__'] = SandboxView(self)
         ns['SandboxDenied'] = SandboxDenied
-        ns['open'] = self.fs_open
+        ns['open'] = _free_method(self.fs_open)
         facades = self.module_builders()
         for name,mod in self._PASSTHROUGH.items():
             if '.' not in name:
@@ -1512,7 +1726,7 @@ class env_box:
         self._boxes = {}
         self.__sealed = False
 
-    def create(self,env_id,name,plugin_dir,policy,_host_token=None):
+    def create(self,env_id,name,plugin_dir,policy,_host_token=None,share=False):
         box = self._boxes.get(env_id)
         if _host_token is not _HOST_TOKEN:
             if box is None:
@@ -1533,12 +1747,22 @@ class env_box:
             old_dir = os.path.normcase(os.path.realpath(box.plugin_dir))
             new_dir = os.path.normcase(os.path.realpath(plugin_dir))
             if old_dir != new_dir:
-                # env_id 是宿主手里的唯一身份键:不同插件目录共用一个 env_id
-                # 等于把两个插件塞进同一个沙盒,绝不合并策略,直接拒绝
-                box.violation('create',
-                              f'env_id={env_id!r} 已被插件目录 {old_dir} 占用,'
-                              f'拒绝与 {new_dir} 共用沙盒',env_id)
-                raise SandboxDenied(f'env_id={env_id!r} 已被其它插件目录占用,拒绝共用沙盒')
+                if not share:
+                    # env_id 是宿主手里的唯一身份键:不同插件目录共用一个 env_id
+                    # 等于把两个插件塞进同一个沙盒,默认绝不合并策略,直接拒绝
+                    box.violation('create',
+                                  f'env_id={env_id!r} 已被插件目录 {old_dir} 占用,'
+                                  f'拒绝与 {new_dir} 共用沙盒',env_id)
+                    raise SandboxDenied(f'env_id={env_id!r} 已被其它插件目录占用,拒绝共用沙盒')
+                # 插件在 plugin.json 里写了 "share_env": true,宿主据此显式要求共用,
+                # 于是复用已有的盒子(两个插件共享同一份命名空间)。
+                # 策略**不合并**:以先装载的那个为准 —— 后装载的插件声明的权限不会
+                # 因为共用而生效(fail-closed),只留一条 note 与一行提示。
+                box.note('share_env',env_id,
+                         f'{new_dir} 与 {old_dir} 共用沙盒(策略以先装载的为准)')
+                print(f'[沙盒] {name} 通过 share_env 与 {old_dir} 共用环境 {env_id!r}'
+                      f'(策略以先装载者为准)')
+                return box
             # 同一个插件目录重复创建:返回已有盒子,不合并策略、不扩权
             return box
         box = SandBox(env_id,name,plugin_dir,policy)
