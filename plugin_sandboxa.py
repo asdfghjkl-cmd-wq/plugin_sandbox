@@ -1,4 +1,71 @@
 # -*- coding: utf-8 -*-
+"""plugin_sandbox —— 插件沙盒本体(能力模型 / 路径判定 / 判权 / 审计 / 门面)。
+
+门面加固历史(按批次,越权样本在 plugin/escape*):
+
+    加固 A(闸门位置,F-escape3)`__getattribute__` 原来只拦一个字面量 `'_d'`。
+    而 `_delegate` 这类**定义在类上**的名字会被 `object.__getattribute__` 直接
+    命中,白名单校验写在 `__getattr__` 里(只有常规查找失败之后才被调用),于是
+    `pro.app._delegate('call')` 一行就绕过整张白名单,拿到真 Tkapp 的 Tcl 通道
+    —— 文件/进程/网络全在 Tcl 的 C 层,既不经过 check_fs 判权,也不产生 Python
+    审计事件。现在改成"下划线开头的名字一律不放行",闸门真正落在属性查找入口。
+
+    加固 B(不留万能旁路,F-escape3)`_delegate(item)` 原来是 `getattr(app,item)`,
+    item 由**调用方**给 —— 等于白名单的万能旁路。现在改名 `_dispatch`,内部
+    **再查一次白名单**;分派逻辑放在模块级 `_menu_dispatch` / `_app_dispatch`
+    里,免得被加固 A 的下划线拦截误伤(详见那两个函数的注释)。
+
+    加固 C(公开方法也是把手,F-escape3)`pro.set_value` 这类**公开**绑定方法的
+    `__self__` 就是宿主对象。HostFacade 现在用 `_free_method` 把它换成不带
+    `__self__` 的普通函数 —— 与 SandboxView 早就采用的口径一致。
+
+    加固 D(数据搬出实例槽,F-escape4)A 管的是"经过重写方法的名字",而
+    `object.__getattribute__(pro.app,'_d')` 是**基类实现**,根本不经过它 ——
+    偏偏原来 `__slots__` 里存的就是 `(真 SandBox, 真 Tkapp)`。现在三个门面的
+    (sb, 真对象) 全搬进模块级 `_FACADE_DATA`(WeakKeyDictionary),槽里只剩
+    `__weakref__`,同样的调用只会得到 AttributeError。
+
+    判权入口对齐(F-escape4)`_apply_grant` 原来是唯一一个既没有凭据校验、也没有
+    插件帧检查的宿主入口,插件拿到 SandBox 就能给自己放开整盘;更麻烦的是它经
+    `_auth_apply_grant` 会 `_snapshot()` 重建 frozen/org,于是 `_auth_tamper`
+    比对的是新基线、连一条 tamper 都不留。现在它与 grant / set_unsafe / set_ask
+    等同口径。
+
+    加固 E(F-escape5,越权样本在 plugin/escape5)`_PASSTHROUGH` 用 `safe_module`
+    (allow=None)把整个 `tkinter` / `ttkbootstrap` 交给插件,而 tkinter 是 `_tkinter`
+    的门:`tkinter.Tcl()` 一行就是真 Tcl 解释器,之后的文件/进程/网络全在 C 层
+    (既不判权也不产生审计事件)。同批还堵了三处:
+      * `_Proxy.wrap` 交出去的是**裸绑定方法** —— `os.listdir.__self__` 一行就是真
+        SandBox,再 `box._host` 就是真 Tkapp(加固 C 只在 HostFacade / SandboxView
+        上做过 `_free_method`,wrap 表漏了);
+      * `_guarded` 的豁免帧可以被**插件交来的对象**借用:`mutagen.File(fp)` /
+        `Image.open(fp)` 会调 `fp.read/seek/tell`,那些回调正好落在 `_guarded` 的
+        动态范围内 —— 钩子整体豁免,插件在自己的 read 里做任意 I/O
+        (作者堵过 `open(opener=)` 这一处,同一条理由没覆盖这条);
+      * 审计钩子的两个 fail-open 判据:`sandbox_compile` 原来不登记 code;回调登记
+        (`mark_bind_owner` / `mark_callback_owner`)对没有 `__code__` 的可调用对象
+        静默返回 False;`_hook` 在"栈上认不出插件帧"时直接放行 —— 三者合起来就是
+        "把执行搬到 after 回调里,栈上就没有插件帧"。
+    界面模块改成**显式例外**:默认只给"对话框 + 常量"的受限 tkinter(messagebox /
+    simpledialog / filedialog / colorchooser 走各自的函数白名单),要自己画界面的插件
+    必须在 plugin.json 里写 `sandbox.ui=true`;装载时 `describe()` 会点名
+    "界面模块:允许……隔离不再成立"(拿到任何 Tk 对象就等于放弃隔离,这是方案的固有
+    上限,现在至少是**登记在案的例外**而不再是默认敞开)。`_NEVER_MODULES` 另外把
+    `_tkinter` / `PIL.ImageTk` / ctypes / 线程 / sys / inspect / gc / pickle /
+    marshal / os / io / builtins / importlib 这些"钩子够不着或能让认帧失效"的模块
+    钉死:plugin.json 声明 + 宿主 approve_modules 也一律不放行。
+
+自带回归夹具是文件末尾的 `facade_selftest()`(自建沙盒 + 假宿主 + 真审计钩子),
+A/B/C/D/E 与 _apply_grant 都有断言;今后加加固请往那里补一条。
+
+残留(未修,属方案固有上限,与 SANDBOX.md 口径一致):
+  * 同进程内省:`__sandbox__.can.__closure__[0].cell_contents.__self__` 仍能拿回
+    SandBox、`type(pro.app).__init__.__globals__` 仍能拿到本模块 globals ——
+    同一进程里无法根治;
+  * Tcl 解释器本身(C 层不产生 Python 审计事件)依旧是"拿到 Tk 对象即失守"的
+    通道。加固 E 之后,门面白名单与模块代理都不再交付这种对象,唯一的例外是
+    plugin.json 里**显式**声明 `sandbox.ui=true` 的插件 —— 那等于它自己放弃了隔离。
+"""
 
 import pickle
 import builtins as _builtins
@@ -132,7 +199,7 @@ class Policy:
 
     _FREEZE_KEYS = frozenset(('fs_read','fs_write','net','proc','ask','unsafe',
                               'unsafe_requested','modules','modules_requested',
-                              'plugin_dir','warnings'))
+                              'plugin_dir','warnings','ui'))
 
     def __init__(self,plugin_dir):
         self.plugin_dir = os.path.abspath(plugin_dir)
@@ -143,6 +210,12 @@ class Policy:
         self.ask = True
         self.unsafe = False
         self.unsafe_requested = False
+        # 加固 E(F-escape5):界面模块(tkinter / ttkbootstrap)是**显式例外**,不再
+        # 默认放行。任何 Tk 对象(widget / Toplevel / PhotoImage)的实例都能顺着
+        # `.tk` / `.master.tk` 拿到真 `_tkinter.tkapp`,而那之后的文件/进程/网络都在
+        # C 层 —— 审计钩子看不见。要自己画界面的插件必须在 plugin.json 里写
+        # sandbox.ui=true,装载时会在权限说明里被点名。
+        self.ui = False
         self.modules = []
         # 插件在 plugin.json 里只能"申请"模块:modules_requested 是插件填的,
         # modules 只有宿主 approve_modules() 之后才会非空
@@ -185,6 +258,7 @@ class Policy:
         snap.ask = bool(self.ask)
         snap.unsafe = bool(self.unsafe)
         snap.unsafe_requested = bool(self.unsafe_requested)
+        snap.ui = bool(self.ui)
         snap.modules = tuple(self.modules)
         snap.modules_requested = tuple(self.modules_requested)
         snap.warnings = []
@@ -200,6 +274,9 @@ class Policy:
             out.append('网络:允许')
         if self.proc:
             out.append('外部进程:允许')
+        if self.ui:
+            out.append('界面模块:允许(tkinter/ttkbootstrap;Tcl 通道随之打开,'
+                       '沙盒对该插件的隔离不再成立)')
         if self.modules:
             out.append('额外模块:' + ','.join(self.modules))
         pend = [m for m in self.modules_requested if m not in tuple(self.modules)]
@@ -233,7 +310,7 @@ def parse_policy(raw_sandbox,legacy_privilege,plugin_dir):
     if raw_sandbox is not None and not isinstance(raw_sandbox,dict):
         p.warnings.append('sandbox 不是 JSON 对象,按默认(最严)处理')
 
-    known = ('fs_read','fs_write','net','proc','ask','unsafe','modules')
+    known = ('fs_read','fs_write','net','proc','ask','unsafe','modules','ui')
     for k in raw:
         if k not in known:
             p.warnings.append(f'sandbox 里的未知键 {k!r} 已忽略')
@@ -260,6 +337,17 @@ def parse_policy(raw_sandbox,legacy_privilege,plugin_dir):
         elif v:
             p.unsafe_requested = True
             p.warnings.append('sandbox.unsafe=true:要求完全不受沙盒限制,需要你在装载时确认')
+
+    v = raw.get('ui',None)
+    if v is not None:
+        if not isinstance(v,bool):
+            p.warnings.append('sandbox.ui 不是布尔值,未生效')
+        elif v:
+            p.ui = True
+            p.warnings.append(
+                'sandbox.ui=true:插件会拿到真 tkinter / ttkbootstrap。任何 Tk 对象都能'
+                '顺着 .tk 拿到 Tcl 解释器,而那之后的文件/进程/网络在 C 层,审计钩子'
+                '看不见 —— 等于放弃对这个插件的隔离。它确实要自己画界面时才勾')
 
     mods = raw.get('modules',None)
     if mods is not None:
@@ -403,7 +491,14 @@ class _Proxy:
             sb.violation('attr',f'{label}.{item} 已被沙盒禁用',None)
             raise SandboxDenied(f'{label}.{item} 被插件沙盒禁用')
         if item in wrap:
-            return wrap[item]
+            # 加固 E(F-escape5):wrap 表原来把**绑定方法**直接交出去,`os.listdir.
+            # __self__` 一行就是真 SandBox(再 `box._host` 就是真 Tkapp)。加固 C 只在
+            # HostFacade / SandboxView 上做过这件事,这里是所有门面模块共用的出口,
+            # 口径必须一致:交出前换成不带 __self__ 的普通函数。
+            value = wrap[item]
+            if type(value).__name__ == 'method' and getattr(value,'__self__',None) is not None:
+                return _free_method(value,item)
+            return value
         if item.startswith('__') and item.endswith('__'):
             raise AttributeError(item)
         allowed = allow is not None and item in allow
@@ -481,6 +576,66 @@ class SandboxView:
             return f'<sandbox {self.name}: {self.describe()}>'
         except Exception:
             return f'<sandbox {self.name}>'
+
+_DENIED_DATA = weakref.WeakKeyDictionary()
+
+class _DeniedFacade:
+    """一个"明确拒绝"的模块替身:任何属性访问都记 violation 再抛 SandboxDenied。
+
+    加固 E(F-escape5):`tkinter` / `ttkbootstrap` 这类模块不能作为模块交给插件,
+    但直接从命名空间里删掉会让插件只拿到 `NameError`(既没有明确原因,也不留审计)。
+    这里给一个替身:名字还在,一碰就记一条 violation 并拒绝。
+    """
+
+    __slots__ = ('__weakref__',)
+
+    def __init__(self,sb,label,why):
+        _DENIED_DATA[self] = (sb,label,why)
+
+    def __getattribute__(self,name):
+        if name.startswith('__') and name.endswith('__'):
+            raise AttributeError(name)
+        sb,label,why = _DENIED_DATA[self]
+        sb.violation('module_attr',f'插件不能访问 {label}.{name}:{why}',None)
+        raise SandboxDenied(f'{label} 已被插件沙盒禁用:{why}')
+
+    def __repr__(self):
+        try:
+            sb,label,why = _DENIED_DATA[self]
+        except KeyError:
+            return '<sandbox denied module (detached)>'
+        return f'<sandbox denied module {label} for {sb.name}>'
+
+
+# 加固 E(F-escape5):`approve_modules` 放行的模块是"不经沙盒代理"直接交给插件的,
+# 唯一剩下的防线就是审计钩子。可下面这些连审计钩子都够不着(或者能让钩子的
+# "认帧"判据失效),所以必须在放行这一层就堵死:
+#   * _tkinter / PIL.ImageTk:直接就是 Tcl 通道(顶层 tkinter/ttkbootstrap 现在
+#     有受限代理,由 sandbox.ui 决定松紧,不在这张表里);
+#   * ctypes:直接调动态库,不产生 Python 审计事件;
+#   * _thread/threading/asyncio/multiprocessing/signal/pty/tty:回调跑在**新线程**
+#     或新事件循环里,栈扫描看到的不是插件栈 -> "认不出插件帧就放行"直接成立;
+#   * sys/inspect/gc:直接给出 frame / globals / 解释器内部;
+#   * os/io/builtins/importlib:不受代理约束的裸 I/O 与导入(环境变量等也不留事件);
+#   * pickle/marshal/shelve/dbm/sqlite3:反序列化即执行。
+_NEVER_MODULES = frozenset((
+    '_tkinter','PIL.ImageTk',
+    'ctypes','_ctypes',
+    '_thread','threading','multiprocessing','asyncio','signal','pty','tty',
+    'sys','inspect','gc',
+    'os','io','builtins','importlib','_imp',
+    'pickle','marshal','shelve','dbm','sqlite3',
+))
+
+# 宿主引用表:SandBox -> 真 Tkapp / 门面。
+#
+# 加固 E(F-escape5):`_host` / `_facade` 原来挂在实例字典上,而 SandBox 只重写了
+# `__setattr__`(guarded_names),没有重写 `__getattribute__` —— 于是插件顺着门面
+# 交付的绑定方法拿到 box 之后(`os.listdir.__self__`),`box._host` 一步就是真
+# Tkapp,`.call(...)` 走 Tcl 的 C 层。与加固 D 同口径:数据搬出实例字典,
+# 插件读到的只有 AttributeError。
+_BOX_HOST = weakref.WeakKeyDictionary()
+_BOX_FACADE = weakref.WeakKeyDictionary()
 
 _AUTH = {}
 
@@ -617,7 +772,7 @@ def _auth_tamper(box,_entry=_auth_entry):
         if (live_read != tuple(ent['frozen'].fs_read)
                 or live_write != tuple(ent['frozen'].fs_write)):
             tampered.append('policy 里的读写目录')
-        for key in ('net','proc','unsafe'):
+        for key in ('net','proc','unsafe','ui'):
             if bool(getattr(live,key)) != bool(getattr(ent['frozen'],key)):
                 tampered.append('policy.' + key)
     try:
@@ -658,8 +813,6 @@ class SandBox:
         self._ask = None
         self._persist = None
         self._persist_deny = None
-        self._host = None
-        self._facade = None
         self._local_modules = {}
         self._module_cache = {}
         self.__sealed = False
@@ -827,7 +980,7 @@ class SandBox:
             raise SandboxDenied(f'插件 {self.name} 的沙盒已封存,不能再改策略')
         cap = args[0] if args else kwargs.get('cap')
         target = args[1] if len(args) > 1 else kwargs.get('target')
-        self._apply_grant(cap,target,persist=False)
+        self._apply_grant(cap,target,persist=False,_host_token=_HOST_TOKEN)
         self.note('grant','*',target,f'宿主授予 {cap}')
 
     def set_unsafe(self,value=True,_host_token=None):
@@ -855,13 +1008,32 @@ class SandBox:
             if not isinstance(item,str) or not re.fullmatch(r'[A-Za-z_][\w.]*',item):
                 self.violation('approve_modules',f'{item!r} 不是合法模块名,未放行',None)
                 continue
+            # 加固 E(F-escape5):硬黑名单在这里也要拦一次。放行的模块是"不经沙盒
+            # 代理"直接交给插件的,唯一剩下的防线是审计钩子 —— 而黑名单里的东西
+            # 恰恰是钩子够不着(或能让"认帧"失效)的那些。
+            if item in _NEVER_MODULES or item.split('.')[0] in _NEVER_MODULES:
+                self.violation(
+                    'approve_modules',
+                    f'{item!r} 属于沙盒硬黑名单,永久不予放行(拿到它等于失守)',None)
+                continue
             if item not in cur:
                 cur.append(item)
         self.policy.modules = cur
         self.note('approve_modules','*',None,f'宿主放行模块:{",".join(cur) or "无"}')
         return tuple(cur)
 
-    def _apply_grant(self,cap,target,persist=False,_entry=_auth_entry):
+    def _apply_grant(self,cap,target,persist=False,_host_token=None,_entry=_auth_entry):
+        # F-escape4:`_apply_grant` 是宿主 grant() 的内部实现,原来**既没有凭据校验、
+        # 也没有插件帧检查** —— 而同一个文件里 grant / set_unsafe /
+        # approve_modules / set_ask / set_persist / set_persist_deny /
+        # remember_denied / env_box.grant / env_box.create 全都做了。于是插件只要
+        # 拿到 SandBox 实例,`sb._apply_grant('fs:write', r'C:\\')` 就给自己放开了
+        # 整盘;更麻烦的是它经 _auth_apply_grant 会 _snapshot() 重建 frozen/org,
+        # 于是 _auth_tamper 比对的是**新基线**,连一条 tamper 都不会留下。
+        # 这里与同级入口对齐:只有拿着宿主凭据的调用方能进来。
+        if _host_token is not _HOST_TOKEN:
+            self.violation('grant','插件试图直接调用 _apply_grant 给自己授权',None)
+            raise SandboxDenied(f'插件 {self.name} 不能给自己授权(只有宿主能)')
         # 用 _grant_scope 而不是 _grant_root:授权往往发生在文件被创建之前,
         # 那时 isfile 为假,必须把"即将新建的文件"归一成它所在的目录,
         # 否则会话里存的是文件路径,目录级的 under() 判定永远通不过。
@@ -985,7 +1157,7 @@ class SandBox:
             self.refuse_plugin_caller('remember_denied')
         key = self._ask_key(cap,target)
         self._never_ask.add(key)
-        ent = _entry(self)
+        ent = _entry(self) # type: ignore
         never = ent.get('never_ask')
         if never is not None:
             never.add(key)
@@ -993,12 +1165,16 @@ class SandBox:
         return True
 
     def attach_host(self,tkaapp,facade=None,**kwargs):
-        self._host = tkaapp
+        # 加固 E:`_host` / `_facade` 不再放进实例字典(见 _BOX_HOST 处的注释)。
         if tkaapp is None:
+            _BOX_HOST.pop(self,None)
+            _BOX_FACADE.pop(self,None)
             return None
-        self._facade = HostFacade(self,tkaapp) if facade is None else facade
-        self.namespace['pro'] = self._facade
-        return self._facade
+        _BOX_HOST[self] = tkaapp
+        host_facade = HostFacade(self,tkaapp) if facade is None else facade
+        _BOX_FACADE[self] = host_facade
+        self.namespace['pro'] = host_facade
+        return host_facade
 
     def audit(self,limit=20):
         # 读模块私有的记账那份,不读 self.events:后者是插件能 clear() 的影子。
@@ -1093,7 +1269,8 @@ class SandBox:
             self.note('grant_once',cap,target,detail)
             return True
         if ans in (ASK_SESSION,ASK_ALWAYS):
-            self._apply_grant(cap,target,persist=(ans == ASK_ALWAYS))
+            self._apply_grant(cap,target,persist=(ans == ASK_ALWAYS),
+                              _host_token=_HOST_TOKEN)
             self.note('grant_'+ans,cap,target,detail)
             return True
         self.note('denied_by_user',cap,target,detail)
@@ -1439,7 +1616,42 @@ class SandBox:
         return _Proxy(self,real,name,allow=None,wrap=wrap,deny=deny)
 
     def imagetk_module(self):
-        return self.safe_module('ImageTk',_PILImageTk)
+        # 加固 E(F-escape5):ImageTk 原来也是 allow=None 的全权代理,而
+        # `ImageTk.PhotoImage(img)` 在没有 master 时会取**默认 root**,实例上的
+        # 那张 tkinter.PhotoImage 带 `.tk` = 真 Tkapp -> Tcl 通道。
+        # 显示图片请走宿主门面,不要拿真模块。
+        return _DeniedFacade(
+            self,'ImageTk',
+            '它会给出带 .tk 的 PhotoImage(等于把 Tcl 通道交给插件);请走 pro 门面')
+
+    def tkinter_module(self):
+        """界面模块的唯一出口。
+
+        `policy.ui` 为真(插件在 plugin.json 里写了 sandbox.ui=true)才给真模块;
+        否则只给"对话框 + 常量"的受限代理 —— 那里面没有任何东西能取到 `.tk`。
+        """
+        if self.policy.ui:
+            self.note('ui_module','*','tkinter',
+                      '插件声明了 sandbox.ui,交付真 tkinter(隔离对该插件不成立)')
+            return _Proxy(self,tkinter,'tkinter')
+        wrap = {}
+        for name,allow in self._TK_SUBMODULES.items():
+            real = getattr(tkinter,name,None)
+            if real is None:
+                continue
+            wrap[name] = _Proxy(self,real,'tkinter.'+name,allow=allow)
+        return _Proxy(self,tkinter,'tkinter',allow=self._TK_TOP_ALLOW,wrap=wrap,
+                      deny=self._TK_DENY)
+
+    def ttkbootstrap_module(self):
+        if self.policy.ui:
+            self.note('ui_module','*','ttkbootstrap',
+                      '插件声明了 sandbox.ui,交付真 ttkbootstrap(隔离对该插件不成立)')
+            return _Proxy(self,ttkbootstrap,'ttkbootstrap')
+        return _DeniedFacade(
+            self,'ttkbootstrap',
+            '它是 Tk / Toplevel / 各种 widget 的再导出,等于把 Tcl 通道交出去;'
+            '插件确实要自己画界面,请在 plugin.json 里写 sandbox.ui=true')
 
     def module_builders(self):
         if not self._module_cache:
@@ -1454,6 +1666,8 @@ class SandBox:
                 'PIL':self.image_module(),
                 'mutagen':self.mutagen_module(),
                 'builtins':self.builtins_view(),
+                'tkinter':self.tkinter_module(),
+                'ttkbootstrap':self.ttkbootstrap_module(),
             }
             for name,mod in self._PASSTHROUGH.items():
                 if '.' in name:
@@ -1461,21 +1675,54 @@ class SandBox:
                 self._module_cache.setdefault(name,self.safe_module(name,mod))
         return self._module_cache
 
+    # 加固 E(F-escape5):这里原来有 'tkinter' / 'tkinter.ttk' / 'tkinter.simpledialog'
+    # / 'tkinter.messagebox' / 'tkinter.filedialog' / 'tkinter.colorchooser' /
+    # 'tkinter.font' / 'ttkbootstrap'。它们不是"界面工具模块":tkinter 是 _tkinter
+    # 的门,`tkinter.Tcl()` 一行就是真 Tcl 解释器;ttkbootstrap 把 Tk/Window 一起
+    # 再导出;tkinter 的**任何 widget 类**在没有 master 时都会取默认 root,实例上的
+    # `.tk` 同样是真 Tkapp。而 `safe_module` 的 allow 是 None,等于整模块放行 ——
+    # 文件头第 41-42 行写着"门面白名单里不该出现 call/eval/tk",这里就是那扇没关的门。
+    # 插件画界面/加菜单走 pro.app / pro.menu(已被 escape3/4 两批验证过)。
     _PASSTHROUGH = {
         'json':_json,'re':re,'math':math,'random':random,'time':time,
         'datetime':datetime,'collections':collections,'itertools':itertools,
         'functools':functools,'string':string,'textwrap':textwrap,
         'traceback':traceback,'logging':logging,
-        'tkinter':tkinter,'tkinter.ttk':tkinter.ttk,
-        'tkinter.simpledialog':tkinter.simpledialog,
-        'tkinter.messagebox':tkinter.messagebox,
-        'tkinter.filedialog':tkinter.filedialog,
-        'tkinter.colorchooser':tkinter.colorchooser,
-        'tkinter.font':tkinter.font,
-        'ttkbootstrap':ttkbootstrap,
     }
 
-    _SUBMODULE_PACKAGES = ('tkinter','ttkbootstrap','PIL')
+    _SUBMODULE_PACKAGES = ('PIL',)
+
+    # 加固 E(F-escape5):默认(没写 sandbox.ui)时 tkinter 只留"对话框 + 常量"。
+    # 能取到 `.tk` 的东西一律不给:Tk / Tcl / Toplevel / 任何 widget 类(没有 master
+    # 时它会取默认 root,实例的 .tk 就是真 Tkapp)/ PhotoImage / ttk / font。
+    _TK_TOP_ALLOW = frozenset((
+        'TclError','TclVersion','TkVersion','wantobjects',
+        'READABLE','WRITABLE','EXCEPTION','NORMAL','DISABLED','ACTIVE','HIDDEN',
+        'END','INSERT','CURRENT','ANCHOR','LEFT','RIGHT','TOP','BOTTOM','CENTER',
+        'N','S','E','W','NE','NW','SE','SW','NS','EW','NSEW','X','Y','BOTH',
+        'SINGLE','MULTIPLE','BROWSE','EXTENDED','TRUE','FALSE','YES','NO',
+        'OK','CANCEL','NONE','ALL','LAST','WORD','CHAR',
+        'HORIZONTAL','VERTICAL','RAISED','SUNKEN','FLAT','GROOVE','RIDGE',
+        'SOLID','BEVEL','MITER','ROUND','PROJECTING','BUTT',
+        'getint','getdouble','getboolean',
+    ))
+
+    # 对话框子模块各自的白名单:只放"函数",不放会暴露 master/root 的类
+    # (`messagebox.Message()` / `filedialog.FileDialog()` 的实例都有 .master.tk)。
+    _TK_SUBMODULES = {
+        'messagebox':frozenset((
+            'showinfo','showwarning','showerror','askquestion','askokcancel',
+            'askyesno','askyesnocancel','askretrycancel',
+            'ABORT','RETRY','IGNORE','OK','CANCEL','YES','NO')),
+        'simpledialog':frozenset(('askstring','askinteger','askfloat')),
+        'filedialog':frozenset((
+            'askopenfilename','askopenfilenames','asksaveasfilename','askdirectory',
+            'askopenfile','askopenfiles','asksaveasfile')),
+        'colorchooser':frozenset(('askcolor',)),
+    }
+
+    _TK_DENY = ('Tk','Tcl','Toplevel','ttk','font','PhotoImage','BitmapImage',
+                '_tkinter','NoDefaultRoot','mainloop')
 
     @staticmethod
     def _dotted_exists(obj,name):
@@ -1487,12 +1734,28 @@ class SandBox:
                 return False
         return True
 
+    def _reject_never_module(self,name):
+        """加固 E(F-escape5):硬黑名单的唯一入口。
+
+        只在"真模块会被直接交给插件"的路径上调用 —— 有沙盒代理的模块
+        (`os`/`sys`/`io`/`socket`/…) 照常走代理,不受影响。
+        """
+        root = name.split('.')[0]
+        if name in _NEVER_MODULES or root in _NEVER_MODULES:
+            self.violation('import',
+                           f'import {name!r} 命中了沙盒硬黑名单(拿到它就等于失守)',name)
+            raise SandboxDenied(
+                f'import {name!r} 被插件沙盒永久拒绝:{root!r} 属于禁止模块')
+
     def _resolve_module(self,name):
         root = name.split('.')[0]
         built = self.module_builders().get(root)
         if built is not None:
             if '.' not in name:
                 return built
+            # 顶层有代理不代表子模块安全:`PIL.ImageTk` 就会给出带 .tk 的
+            # PhotoImage(拿默认 root),所以子模块解析前也要过黑名单。
+            self._reject_never_module(name)
             if self._dotted_exists(built,name):
                 sub = built
                 for part in name.split('.')[1:]:
@@ -1506,6 +1769,7 @@ class SandBox:
         if name in self._PASSTHROUGH:
             return self.safe_module(name,self._PASSTHROUGH[name])
         if root in self._PASSTHROUGH:
+            self._reject_never_module(name)
             if root in self._SUBMODULE_PACKAGES:
                 try:
                     mod = _importlib.import_module(name)
@@ -1515,6 +1779,9 @@ class SandBox:
                           f'{root} 的子模块,只提供界面/工具能力')
                 return self.safe_module(name,mod)
             return None
+        # 插件目录里的本地模块、以及 plugin.json 声明 + 宿主放行的模块:都在
+        # "不给代理"这一侧,所以先过黑名单。
+        self._reject_never_module(name)
         local = self.import_local(root)
         if local is not None:
             return local
@@ -1693,7 +1960,14 @@ class SandBox:
     def sandbox_compile(self,source,filename=None,mode='exec',*args,**kwargs):
         if filename is None:
             filename = f'<plugin {self.name} exec>'
-        return _builtins.compile(source,filename,mode,*args,**kwargs)
+        code = _builtins.compile(source,filename,mode,*args,**kwargs)
+        # 加固 E(F-escape5):这里原来**不登记** code,而 sandbox_exec / sandbox_eval
+        # 对字符串源码都会自己编译并登记 —— 于是"用 compile() 造一个未登记 code,
+        # 再用 type(lambda:0)(code,ns) 包成函数,经 after 投给宿主事件循环"就是一条
+        # 现成的路:回调执行时栈上的 code 谁都不认识,审计钩子直接放行。
+        # 编译出来就登记,与那两个入口对齐(register_code 自己会判类型,AST 安全)。
+        register_plugin_code(self,code)
+        return code
 
     def _build_namespace(self):
         ns = self.namespace
@@ -1707,6 +1981,10 @@ class SandBox:
         for name,mod in self._PASSTHROUGH.items():
             if '.' not in name:
                 ns[name] = facades.get(name) or self.safe_module(name,mod)
+        # 加固 E:界面模块由 facades 统一出口给出(policy.ui 决定松紧),不再走
+        # _PASSTHROUGH 的 allow=None。
+        ns['tkinter'] = facades['tkinter']
+        ns['ttkbootstrap'] = facades['ttkbootstrap']
         ns['os'] = facades['os']
         ns['sys'] = facades['sys']
         ns['io'] = facades['io']
@@ -1715,8 +1993,9 @@ class SandBox:
         ns['mutagen'] = facades['mutagen']
         ns['plugin_dir'] = self.plugin_dir
         ns['__env_id__'] = self.env_id
-        if self._host is not None:
-            ns['pro'] = self._facade or self._host
+        host = _BOX_HOST.get(self)
+        if host is not None:
+            ns['pro'] = _BOX_FACADE.get(self) or host
         return ns
 
 class env_box:
@@ -1810,49 +2089,150 @@ class env_box:
             raise SandboxDenied(f'没有 env_id={args[0]!r} 的沙盒')
         return box.grant(*args[1:],_host_token=_HOST_TOKEN)
 
+# 门面数据表:门面实例 -> (sb, 真对象)。
+#
+# 加固 D(F-escape4):这些数据原来存在门面的 __slots__ 里
+# (`object.__setattr__(self,'_d',(sb,真宿主))`),而**属性协议拦不住基类实现**:
+#
+#     object.__getattribute__(pro.app,'_d')
+#
+# 一行就把 (真 SandBox, 真 Tkapp) 取走了 —— 加固 A 在 `__getattribute__` 里怎么
+# 判名字都没用,因为上面那句话根本不经过那个重写的方法。数据搬出实例槽之后,
+# 同样的调用只会得到 AttributeError。
+#
+# 用 WeakKeyDictionary 是为了不给门面实例续命;__slots__ 里必须留 '__weakref__'
+# 才能拿实例当弱引用键(和 _Proxy 的 __slots__ = ('__weakref__',) 同一个理由)。
+_FACADE_DATA = weakref.WeakKeyDictionary()
+
 def _facade_leak(obj,label,name):
-    sb = object.__getattribute__(obj,'_d')[0]
+    sb = _FACADE_DATA[obj][0]
     sb.violation('host_attr',f'插件不能访问 {label}.{name}',None)
     raise SandboxDenied(
         f'插件不能访问 {label}.{name}'
         f'(那是门面的内部数据,拿走就等于把宿主交出去)')
 
+def _menu_call(sb,menu,item):
+    """白名单内的菜单调用闭包。"""
+    target = getattr(menu,item)
+
+    def call(*a,**k):
+        return target(*a,**k)
+    return call
+
+def _menu_dispatch(facade,item):
+    """加固 B(菜单侧):item 必须来自白名单。
+
+    写成**模块级函数**而不是门面的方法,是这次修复里最容易踩的坑:
+    `__getattr__` 里若是 `self._dispatch(item)`,那句属性查找会先经过
+    `__getattribute__`,而加固 A 把下划线开头的名字全拦了 —— 白名单里的
+    `add_command` 反而会以 "不能访问 pro.menu._dispatch" 被拒,合法能力全废。
+    模块级函数只走全局名查找,不经过门面的属性协议,结构上不可能被这件事绊到。
+    """
+    if item not in _MenuFacade._ALLOW:
+        facade.violation('host_attr',f'插件不能访问 pro.menu.{item}',None)
+        raise SandboxDenied(f'插件不能访问 pro.menu.{item}(只能加菜单项)')
+    sb,menu = _FACADE_DATA[facade]
+    if menu is None:
+        sb.violation('host_attr',f'pro.menu 没有可用的菜单对象({item})',None)
+        raise SandboxDenied(f'pro.menu.{item} 当前不可用')
+    return _menu_call(sb,menu,item)
+
+def _app_dispatch(facade,item):
+    """加固 B(app 侧):item 必须来自白名单,否则不给 getattr(app,item)。
+
+    原来 `_delegate` 无条件 `getattr(app,item)`,插件传 'call' 就能拿到真实 Tcl
+    通道(app.call),之后的文件/进程/网络 I/O 全在 Tcl 的 C 层:不经过
+    check_fs 判权,也不产生 Python 审计事件。这里把"取哪个属性"重新收回白名单。
+    """
+    if item not in _AppFacade._ALLOW:
+        facade.violation('host_attr',f'插件不能访问 pro.app.{item}',None)
+        raise SandboxDenied(
+            f'插件不能访问 pro.app.{item}'
+            f'(Tk 的 Tcl 通道沙盒挡不住,所以这里只放行白名单方法)')
+    sb,app = _FACADE_DATA[facade]
+    if app is None:
+        sb.violation('host_attr',f'pro.app 没有可用的窗口对象({item})',None)
+        raise SandboxDenied(f'pro.app.{item} 当前不可用')
+    target = getattr(app,item)
+
+    if item in _AppFacade._CALLBACK_CHANNELS or item in _AppFacade._BIND_CHANNELS:
+        sticky = item in _AppFacade._BIND_CHANNELS
+        def call_cb(*a,**k):
+            for arg in a:
+                if not callable(arg):
+                    continue
+                try:
+                    on_stack = is_plugin_frame_on_stack()
+                except Exception:
+                    # 判不了就不放行:回调"归属未登记"正是钩子认帧失效的前提
+                    logging.exception('判定回调归属失败,按 fail-closed 拒绝')
+                    raise SandboxDenied(
+                        '沙盒无法判定回调归属,已拒绝这次回调注册')
+                if not on_stack:
+                    continue
+                # 加固 E(F-escape5):登记失败原来是静默的(只在 except 里记日志),
+                # 于是"实例 / partial / C 函数"这类没有 __code__ 的可调用对象被原样
+                # 投给 Tk;等它在新的事件循环里执行时,栈上认不出任何插件帧,
+                # 审计钩子直接放行(mark_callback_owner 返回 False 也不报错)。
+                # 现在:登记不成 -> violation + 拒绝。
+                ok = (mark_bind_owner if sticky else mark_callback_owner)(sb,arg)
+                if not ok:
+                    sb.violation(
+                        'host_attr',
+                        f'插件投递的回调({type(arg).__name__})没有可识别的 code 身份,'
+                        f'钩子认不出它,按 fail-closed 拒绝',None)
+                    raise SandboxDenied(
+                        f'插件 {sb.name} 投递的回调无法登记 code 身份;'
+                        f'请用插件源码里定义的函数(沙盒要求回调可识别)')
+            return target(*a,**k)
+        return call_cb
+
+    def call(*a,**k):
+        return target(*a,**k)
+    return call
+
 class _MenuFacade:
 
-    __slots__ = ('_d',)
+    # 加固 D:槽里不再放宿主引用(见 _FACADE_DATA 处的注释)。
+    __slots__ = ('__weakref__',)
 
     _ALLOW = ('add_command','add_separator','add_checkbutton','add_radiobutton')
 
     def __init__(self,sb,menu):
-        object.__setattr__(self,'_d',(sb,menu))
+        _FACADE_DATA[self] = (sb,menu)
 
     def __getattribute__(self,name):
-        if name == '_d':
+        # 加固 A:原来只拦 '_d' 这一个字面量,于是类上真实存在的 `_delegate`
+        # 被 object.__getattribute__ 直接命中,而白名单校验在 __getattr__ 里
+        # (只在常规查找失败后才跑)—— 插件 `pro.menu._delegate('任意名字')`
+        # 就能对真实菜单做 getattr。内部名字(含内部方法)一律不放行。
+        if name.startswith('_'):
             _facade_leak(self,'pro.menu',name)
         return object.__getattribute__(self,name)
 
-    def _delegate(self,item):
-        sb,menu = object.__getattribute__(self,'_d')
-        target = getattr(menu,item)
-
-        def call(*a,**k):
-            return target(*a,**k)
-        return call
+    def _dispatch(self,item):
+        # 加固 B:白名单在这里**必须**再生效一次(原来的 `_delegate` 无条件
+        # getattr(menu,item),等于把白名单变成装饰)。逻辑在模块级的
+        # _menu_dispatch 里:那样 __getattr__ 调它时不经过门面的属性协议,
+        # 也就不会被加固 A 的下划线拦截误伤。
+        return _menu_dispatch(self,item)
 
     def __getattr__(self,item):
-        sb,menu = object.__getattribute__(self,'_d')
+        sb,menu = _FACADE_DATA[self]
         if item in _MenuFacade._ALLOW and menu is not None:
-            return self._delegate(item)
+            return _menu_dispatch(self,item)
         sb.violation('host_attr',f'插件不能访问 pro.menu.{item}',None)
         raise SandboxDenied(f'插件不能访问 pro.menu.{item}(只能加菜单项)')
 
     def __repr__(self):
-        sb,menu = object.__getattribute__(self,'_d')
+        sb,menu = _FACADE_DATA[self]
         return f'<sandbox menu for {sb.name}>'
 
 class _AppFacade:
 
-    __slots__ = ('_d',)
+    # 加固 D:槽里不再放宿主引用(见 _FACADE_DATA 处的注释)。原来这里存的是
+    # (sb, 真 Tkapp),而 `object.__getattribute__(pro.app,'_d')` 一步就能取走它。
+    __slots__ = ('__weakref__',)
 
     _ALLOW = ('after','after_idle','after_cancel','title','geometry','deiconify',
               'withdraw','iconify','destroy','update','update_idletasks',
@@ -1865,91 +2245,95 @@ class _AppFacade:
     _BIND_CHANNELS = ('bind','bind_all')
 
     def __init__(self,sb,app):
-        object.__setattr__(self,'_d',(sb,app))
+        _FACADE_DATA[self] = (sb,app)
 
     def __getattribute__(self,name):
-        if name == '_d':
+        # 加固 A:见 _MenuFacade 同处注释。`pro.app._delegate('call')` 就是靠
+        # "白名单在 __getattr__ 里、_delegate 在类上"这一组合走通的。
+        if name.startswith('_'):
             _facade_leak(self,'pro.app',name)
         return object.__getattribute__(self,name)
 
-    def _delegate(self,item):
-        sb,app = object.__getattribute__(self,'_d')
-        target = getattr(app,item)
-
-        if item in _AppFacade._CALLBACK_CHANNELS or item in _AppFacade._BIND_CHANNELS:
-            sticky = item in _AppFacade._BIND_CHANNELS
-            def call_cb(*a,**k):
-                for arg in a:
-                    if not callable(arg):
-                        continue
-                    try:
-                        if is_plugin_frame_on_stack():
-                            if sticky:
-                                mark_bind_owner(sb,arg)
-                            else:
-                                mark_callback_owner(sb,arg)
-                    except Exception:
-                        logging.exception('登记回调归属失败,按未登记处理')
-                return target(*a,**k)
-            return call_cb
-
-        def call(*a,**k):
-            return target(*a,**k)
-        return call
+    def _dispatch(self,item):
+        # 加固 B:逻辑在模块级 _app_dispatch 里(见那里的注释,以及为什么不能
+        # 写成 self._dispatch 被 __getattr__ 调用)。
+        return _app_dispatch(self,item)
 
     def __getattr__(self,item):
-        sb,app = object.__getattribute__(self,'_d')
+        sb,app = _FACADE_DATA[self]
         if item in _AppFacade._ALLOW and app is not None:
-            return self._delegate(item)
+            return _app_dispatch(self,item)
         sb.violation('host_attr',f'插件不能访问 pro.app.{item}',None)
         raise SandboxDenied(
             f'插件不能访问 pro.app.{item}'
             f'(Tk 的 Tcl 通道沙盒挡不住,所以这里只放行白名单方法)')
 
     def __repr__(self):
-        sb,app = object.__getattribute__(self,'_d')
+        sb,app = _FACADE_DATA[self]
         return f'<sandbox app for {sb.name}>'
 
 class HostFacade:
 
-    __slots__ = ('_d','menu','app')
+    # 加固 D:menu / app 本来就是门面对象,留在槽里没有泄密问题;
+    # (sb, pro) 这对宿主引用搬进 _FACADE_DATA(见那里的注释)。
+    # 顺手删掉原来那句 `print(sb,'           ',pro)` —— 每次装载插件都往
+    # 控制台打两个对象地址,是调试残留。
+    __slots__ = ('menu','app','__weakref__')
 
     def __init__(self,sb,pro):
-        object.__setattr__(self,'_d',(sb,pro))
+        _FACADE_DATA[self] = (sb,pro)
         self.menu = _MenuFacade(sb,getattr(pro,'menu',None))
         self.app = _AppFacade(sb,getattr(pro,'app',None))
 
     def __getattribute__(self,name):
-        if name == '_d':
+        # 加固 A:`pro._d` / `pro.set_value.__self__` 这一类都从这里进。
+        # 原来只拦 '_d',于是 `pro.set_value` 这种**公开方法**照样能把宿主对象
+        # 顺着 `__self__` 交出去。内部名字(含内部方法)一律不放行;_d 仍走
+        # _facade_leak 记一条 violation。
+        if name.startswith('_'):
             _facade_leak(self,'pro',name)
-        return object.__getattribute__(self,name)
+        value = object.__getattribute__(self,name)
+        # 加固 C:公开的绑定方法也是"宿主对象的一个把手"。`_free_method` 在
+        # SandboxView 上做过同样的处理(见 298-316 行),这里把门面上所有
+        # __self__ 指回 pro 的绑定方法统一换成不带 __self__ 的普通函数。
+        # 注意必须用**类型名**比较:`_free_method` 是模块级函数,它在同一模块里
+        # 定义,而这里的比较基准(宿主类)可能来自宿主模块,不能靠 isinstance。
+        if type(value).__name__ == 'method' and getattr(value,'__self__',None) is not None:
+            if getattr(value,'__self__',None) is not value:
+                return _free_method(value,name)
+        return value
 
     @property
     def music_dict(self):
-        sb,pro = object.__getattribute__(self,'_d')
+        sb,pro = _FACADE_DATA[self]
         try:
             return copy.deepcopy(pro.music_dict)
         except Exception:
             logging.exception('取播放列表快照失败,返回空表')
             return {}
 
+    def set_value(self,name,value):
+        sb,pro = _FACADE_DATA[self]
+        try:pro.set_value(name,value);return True
+        except Exception:return False
+
     @property
     def plugin_names(self):
-        sb,pro = object.__getattribute__(self,'_d')
+        sb,pro = _FACADE_DATA[self]
         try:
             return [getattr(p,'name','') for p in pro.plugin_list]
         except Exception:
             return []
 
     def __getattr__(self,item):
-        sb,pro = object.__getattribute__(self,'_d')
+        sb,pro = _FACADE_DATA[self]
         sb.violation('host_attr',f'插件不能访问 pro.{item}',None)
         raise SandboxDenied(
             f'插件不能访问 pro.{item};可用的是 pro.menu / pro.app / '
             f'pro.music_dict / pro.plugin_names')
 
     def __repr__(self):
-        sb,pro = object.__getattribute__(self,'_d')
+        sb,pro = _FACADE_DATA[self]
         return f'<sandbox host facade for {sb.name}>'
 
 _FRAME_LOCAL = threading.local()
@@ -2144,17 +2528,22 @@ def mark_bind_owner(box, func):
     target = func
     if not hasattr(target,'__code__'):
         target = getattr(func,'__func__',None) or getattr(func,'func',None)
+    code = getattr(target,'__code__',None)
+    # 加固 E(F-escape5):拿不到 code 的可调用对象(类实例 / functools.partial /
+    # C 函数)在审计钩子的**栈扫描**里认不出来 —— 钩子只按 frame.f_code 归属。
+    # 原来这里照样 `_bind_owner[func]=box` 并返回 True,等于放行了一个"执行时栈上
+    # 没有插件帧"的回调。fail-closed:登记不成就拒绝这次回调注册。
+    if code is None:
+        return False
     try:
         _bind_owner[func] = box
     except TypeError:
         pass
-    code = getattr(target,'__code__',None)
-    if code is not None:
-        try:
-            if code not in _bind_codes:
-                _bind_codes[code] = box
-        except TypeError:
-            pass
+    try:
+        if code not in _bind_codes:
+            _bind_codes[code] = box
+    except TypeError:
+        pass
     return True
 
 def register_plugin_code(box,code):
@@ -2328,6 +2717,9 @@ def install_audit_hook():
     _fs_write_events = _FS_WRITE_EVENTS
     _guard_code = SandBox._guarded.__code__
     _violation_code = SandBox.violation.__code__
+    # 加固 E:"这一帧是不是插件帧"的轻量判据(只查 code 账本,不做目录兜底,
+    # 免得钩子热路径里反复记 fake_frame)。豁免判据要用它先排掉插件帧。
+    _code_of = box_for_code
     _tracked_events = frozenset(
         _fs_read_events + _fs_write_events + _net_events + _proc_events
         + ('open','os.rename','os.replace'))
@@ -2424,6 +2816,18 @@ def install_audit_hook():
             seen = 0
             while frame is not None and seen < 64:
                 code = frame.f_code
+                # 加固 E(F-escape5):豁免原来只看"栈上有没有 _guarded / violation
+                # 帧",而 _guarded 会把**插件交来的对象**交给真实现去调用:
+                #     mutagen.File(fp) / Image.open(fp)  ->  调 fp.read / seek / tell
+                # 那些回调就在 _guarded 的动态范围内,于是钩子对整段 I/O 整体豁免
+                # (作者堵过 open(opener=) 这一处,同一条理由没覆盖 PIL / mutagen)。
+                # 现在从栈顶往下走:**先遇到插件帧**就说明这次 I/O 是插件代码(或门面
+                # 回调的插件代码)发起的,不豁免;先遇到门面帧才豁免。
+                # 合法路径不受影响:插件直接 open()/listdir 时,插件帧在 _guarded
+                # **下面**(更靠栈底),遍历先撞到 _guarded —— 所以"仅本次允许"
+                # (auth=None、靠豁免帧放行)的语义照旧成立。
+                if _code_of(code) is not None:
+                    return False
                 if code is _guard_code or code is _violation_code:
                     return True
                 frame = frame.f_back
@@ -2502,6 +2906,243 @@ def _audit_hook(event,args):
 _ALWAYS_READABLE = tuple(_norm(p) for p in
                          (sys.prefix,sys.base_prefix,os.path.dirname(os.__file__))
                          if p)
+
+_SELFTEST_CODE = '''
+RESULTS = []
+
+# 每条 = (名字, 期望的结局, 动作)。期望的结局有四种:
+#   BLOCK  = 沙盒拒绝(越权向量应该这样)
+#   OK     = 正常返回(白名单能力应该这样)
+#   NOSELF = 抛 AttributeError: 'function' object has no attribute '__self__'
+#            (加固 C 的通过形态:绑定方法已被换成不带 __self__ 的普通函数)
+#   LEAK   = 拿到了宿主对象(加固失败)
+CASES = [
+    ('app._delegate','BLOCK',lambda: pro.app._delegate('call')),
+    ('app._delegate(call)','BLOCK',lambda: pro.app._delegate('call')),
+    ('menu._delegate','BLOCK',lambda: pro.menu._delegate('add_command')),
+    ('app._d','BLOCK',lambda: pro.app._d),
+    ('menu._d','BLOCK',lambda: pro.menu._d),
+    ('pro._d','BLOCK',lambda: pro._d),
+    ('app.call(非白名单)','BLOCK',lambda: pro.app.call),
+    ('app.__class__','BLOCK',lambda: pro.app.__class__),
+    # F-escape4:加固 D(宿主引用搬出实例槽)+ _apply_grant 的凭据校验。
+    # 前三条期望 BLOCK,而它们的通过形态是 AttributeError(槽里压根没这个
+    # 名字)—— `_run` 把 "_d" 的 AttributeError 记成 BLOCK,见那里注释。
+    ('object.__getattribute__(app,"_d")','BLOCK',
+     lambda: object.__getattribute__(pro.app,'_d')),
+    ('object.__getattribute__(menu,"_d")','BLOCK',
+     lambda: object.__getattribute__(pro.menu,'_d')),
+    ('object.__getattribute__(pro,"_d")','BLOCK',
+     lambda: object.__getattribute__(pro,'_d')),
+    ('_apply_grant 自我授权','BLOCK',lambda: _self_grant()),
+    ('Tcl 越权读(经 _delegate)','BLOCK',lambda: _tcl_read()),
+    ('set_value.__self__(宿主把手)','NOSELF',lambda: pro.set_value.__self__),
+    ('menu.add_command','OK',lambda: pro.menu.add_command(label='x')),
+    ('app.title','OK',lambda: pro.app.title('selftest')),
+    ('app.after','OK',lambda: pro.app.after(0,lambda: None)),
+    ('app.winfo_width','OK',lambda: pro.app.winfo_width()),
+    ('pro.music_dict','OK',lambda: type(pro.music_dict).__name__),
+    ('pro.plugin_names','OK',lambda: pro.plugin_names),
+    ('pro.set_value','OK',lambda: pro.set_value('x',1)),
+    # F-escape5(加固 E):界面模块默认不给 Tcl 通道;门面交付物不再带 __self__;
+    # 没有 code 身份的回调注册被 fail-closed 拒绝。
+    ('tkinter.Tcl(默认禁用)','BLOCK',lambda: _tk_factory()),
+    ('tkinter.Tk(默认禁用)','BLOCK',lambda: _tk_class()),
+    ('ttkbootstrap.Window(需 sandbox.ui)','BLOCK',lambda: _tb_window()),
+    ('tkinter.messagebox.showinfo(受限但可达)','OK',
+     lambda: callable(tkinter.messagebox.showinfo)),
+    ('os.listdir.__self__(wrap 表把手)','NOSELF',lambda: os.listdir.__self__),
+    ('Image.open.__self__(wrap 表把手)','NOSELF',lambda: Image.open.__self__),
+    ('投递无 code 身份的回调','BLOCK',lambda: _after_shell()),
+]
+
+# 加固 E 的辅助:属性求值必须放进函数体(受限代理在取属性那一步就抛)。
+def _tk_factory():
+    return tkinter.Tcl()
+
+
+def _tk_class():
+    return tkinter.Tk
+
+
+def _tb_window():
+    return ttkbootstrap.Window()
+
+
+class _Shell:
+    def __call__(self):
+        return None
+
+
+def _after_shell():
+    return pro.app.after(0,_Shell())
+
+
+def _tcl_read():
+    call = pro.app._delegate('call')
+    ch = call('open',TESTFILE,'r')
+    data = call('read',ch)
+    call('close',ch)
+    return data[:20]
+
+
+def _self_grant():
+    """F-escape4:拿到 SandBox 之后直接调宿主内部入口给自己授权。
+
+    注意 box **仍旧拿得到**(同进程内省:sandbox 视图的闭包里是绑定方法 sb.can,
+    `__self__` 就是 SandBox 本体 —— 这条属方案固有上限,见文件头"残留"),所以这条
+    验的不是"拿不到 box",而是"拿到了也没用":_apply_grant 现在要宿主凭据。
+    """
+    sb = __sandbox__.can.__closure__[0].cell_contents.__self__
+    sb._apply_grant('fs:write','C:\\\\')
+
+
+def _run(label,expect,fn):
+    try:
+        value = fn()
+    except SandboxDenied as e:
+        got,detail = 'BLOCK',str(e)[:56]
+    except AttributeError as e:
+        # 两种"通过"形态都长成 AttributeError,靠消息区分:
+        #   __self__ -> 加固 C(绑定方法已被换成不带 __self__ 的普通函数)
+        #   _d       -> 加固 D(数据已搬出实例槽,槽里的名字压根不存在)
+        text = str(e)
+        if '__self__' in text:
+            got,detail = 'NOSELF',text[:56]
+        elif '_d' in text:
+            got,detail = 'BLOCK',text[:56]
+        else:
+            got,detail = 'ERROR',f'{type(e).__name__}: {e}'[:56]
+    except Exception as e:
+        got,detail = 'ERROR',f'{type(e).__name__}: {e}'[:56]
+    else:
+        got,detail = 'OK',repr(value)[:56]
+        if '_Host' in detail or 'Tkapp' in detail:
+            got = 'LEAK'          # 拿到宿主对象:加固失败
+    results.append((label,expect,got,detail))
+
+
+results = []
+for _label,_expect,_fn in CASES:
+    _run(_label,_expect,_fn)
+RESULTS = results
+'''
+
+def facade_selftest(verbose=True):
+    """自证:门面加固 A/B/C/D + 判权入口对齐之后,越权向量全 BLOCK、白名单能力全 OK。
+
+    这是本模块自带的回归夹具,不需要外部脚本:它自建一个沙盒 + 假宿主,
+    install_audit_hook() 之后以**插件身份**编译并执行 _SELFTEST_CODE。
+    返回 {'blocked':[..],'ok':[..],'error':[..]};verbose=True 时打印明细。
+    """
+    import tkinter
+    root = tkinter.Tk()
+    root.withdraw()
+    calls = []
+
+    class _Menu:
+        def add_command(self,**kw):
+            calls.append(kw.get('label'))
+            return 'item'
+
+    class _App:
+        def __init__(self,tkapp):
+            self._tk = tkapp
+
+        def call(self,*a):
+            calls.append(a[0] if a else None)
+            return self._tk.call(*a)
+
+        def after(self,ms,fn=None,*a):
+            if fn is not None:
+                return fn(*a)
+            return 'after-id'
+
+        def title(self,*a):
+            return 'music'
+
+        def winfo_width(self):
+            return 800
+
+    class _Host:
+        def __init__(self,tkapp):
+            self.app = _App(tkapp)
+            self.menu = _Menu()
+            self.music_dict = {'a':1}
+
+        def set_value(self,*a):
+            return True
+
+        @property
+        def plugin_list(self):
+            return []
+
+    plugin_dir = os.path.abspath('.')
+    env = env_box()
+    policy = parse_policy({'fs_read':['.'],'ask':False},None,plugin_dir)
+    box = env.create('facade-selftest','facade-selftest',plugin_dir,policy,
+                     _host_token=_HOST_TOKEN)
+    box.attach_host(_Host(root))
+    box.namespace['__start_sandbox__'] = True
+    env.seal()
+    install_audit_hook()
+    try:
+        src = _SELFTEST_CODE.replace('TESTFILE',repr(
+            os.path.join(plugin_dir,'facade_selftest_probe.tmp').replace('\\','/')))
+        exec(compile(src,'<plugin facade-selftest init>','exec'),box.namespace)
+        results = list(box.namespace.get('RESULTS',()))
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+    out = {'blocked':[],'ok':[],'mismatch':[]}
+    for label,expect,got,detail in results:
+        if got == expect:
+            (out['blocked'] if got == 'BLOCK' else out['ok']).append(label)
+        else:
+            out['mismatch'].append(f'{label}: 期望 {expect},实际 {got}({detail})')
+    # 加固 E(F-escape5)的宿主侧断言:插件侧根本看不到 box 内部,这三条只能在
+    # 宿主这一侧验(与 escape4 那次"补 facet 断言"同一做法)。
+    host_checks = []
+    try:
+        code_obj = box.sandbox_compile('x = 1','C:/escape5_fake_frame.py','exec')
+        host_checks.append(('sandbox_compile 的产物已进 code 账本',
+                            box_for_code(code_obj) is box))
+    except Exception as e:
+        host_checks.append(('sandbox_compile 的产物已进 code 账本',
+                            f'{type(e).__name__}: {e}'))
+    host_checks.append(('SandBox 实例上没有 _host(宿主引用已搬出实例字典)',
+                        not hasattr(box,'_host')))
+    host_checks.append(('SandBox 实例上没有 _facade(宿主引用已搬出实例字典)',
+                        not hasattr(box,'_facade')))
+    for label,okey in host_checks:
+        if okey is True:
+            out['ok'].append(label)
+        else:
+            out['mismatch'].append(f'{label}: 期望 True,实际 {okey!r}')
+    out['clean'] = not out['mismatch']
+    if verbose:
+        width = max((len(label) for label,_,_,_ in results),default=0)
+        print('=' * 72)
+        print('[facade_selftest] 门面加固 A/B/C/D/E + _apply_grant 回归(自建沙盒 + 假宿主)')
+        print('=' * 72)
+        for label,expect,got,detail in results:
+            mark = '  ' if got == expect else '<<'
+            print(f'  {got:<5} 期望{expect:<5} {label:<{width}}  {detail}{mark}')
+        for label,okey in host_checks:
+            mark = '  ' if okey is True else '<<'
+            print(f'  {"OK" if okey is True else "FAIL":<5} 期望OK    {label:<{width}}  {okey}{mark}')
+        print('-' * 72)
+        print(f"结论:{'全部符合预期' if out['clean'] else '存在不符预期项'}"
+              f"  越权向量拦下={len(out['blocked'])}"
+              f"  白名单能力通过={len(out['ok'])}"
+              f"  不符预期={len(out['mismatch'])}")
+        for one in out['mismatch']:
+            print('   !',one)
+        print('=' * 72)
+    return out
+
 if __name__ == "__main__":
     env = env_box()
     env_id = 'main'
